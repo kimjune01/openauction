@@ -60,7 +60,6 @@ type queryResult struct {
 type Advertiser struct {
 	Name            string
 	Cluster         int
-	FreezePosition  bool // keyword advertisers: frozen center + sigma
 	IdealCenter     []float64
 	CommittedCenter []float64
 	Center          []float64
@@ -129,60 +128,57 @@ func (a *Advertiser) Adapt(lambda float64) {
 	}
 	nq := float64(len(a.RoundQueries))
 
-	// Keyword advertisers (FreezePosition=true): only adapt price, not position/sigma
-	if !a.FreezePosition {
-		// --- Position gradient ---
-		grad := make([]float64, len(a.Center))
-		for _, qr := range a.RoundQueries {
-			for d := range grad {
-				grad[d] += qr.Value * (qr.Query[d] - a.Center[d])
-			}
+	// --- Position gradient ---
+	grad := make([]float64, len(a.Center))
+	for _, qr := range a.RoundQueries {
+		for d := range grad {
+			grad[d] += qr.Value * (qr.Query[d] - a.Center[d])
 		}
-		gradMag := vecNorm(grad)
+	}
+	gradMag := vecNorm(grad)
 
-		// --- Sigma gradient ---
-		avgPayment := a.RoundSpend / math.Max(float64(a.RoundWins), 1)
-		sigmaGrad := 0.0
-		for _, qr := range a.RoundQueries {
-			dist2 := squaredDist(qr.Query, a.Center)
-			dScore := 2 * dist2 / (a.Sigma * a.Sigma * a.Sigma)
-			marginalProfit := qr.Value - avgPayment
-			sigmaGrad += dScore * marginalProfit
+	// --- Sigma gradient ---
+	avgPayment := a.RoundSpend / math.Max(float64(a.RoundWins), 1)
+	sigmaGrad := 0.0
+	for _, qr := range a.RoundQueries {
+		dist2 := squaredDist(qr.Query, a.Center)
+		dScore := 2 * dist2 / (a.Sigma * a.Sigma * a.Sigma)
+		marginalProfit := qr.Value - avgPayment
+		sigmaGrad += dScore * marginalProfit
+	}
+	a.Sigma += lr * sigmaGrad / nq
+	a.Sigma = math.Max(a.Sigma, 0.01)
+
+	// --- Position update with relocation cost ---
+	if gradMag >= 1e-10 {
+		stepSize := 0.03
+		newCenter := vecCopy(a.Center)
+		for d := range newCenter {
+			newCenter[d] += (grad[d] / gradMag) * stepSize
 		}
-		a.Sigma += lr * sigmaGrad / nq
-		a.Sigma = math.Max(a.Sigma, 0.01)
 
-		// --- Position update with relocation cost ---
-		if gradMag >= 1e-10 {
-			stepSize := 0.03
-			newCenter := vecCopy(a.Center)
-			for d := range newCenter {
-				newCenter[d] += (grad[d] / gradMag) * stepSize
-			}
+		newDist2 := squaredDist(newCenter, a.CommittedCenter)
+		curDist2 := squaredDist(a.Center, a.CommittedCenter)
+		cost := lambda * (newDist2 - curDist2)
+		if cost < 0 {
+			cost = 0
+		}
 
-			newDist2 := squaredDist(newCenter, a.CommittedCenter)
-			curDist2 := squaredDist(a.Center, a.CommittedCenter)
-			cost := lambda * (newDist2 - curDist2)
-			if cost < 0 {
-				cost = 0
-			}
+		totalWeight := 0.0
+		for _, qr := range a.RoundQueries {
+			totalWeight += qr.Value
+		}
+		avgValue := totalWeight / nq
+		expectedGain := avgValue * math.Max(1, nq/5-float64(a.RoundWins))
 
-			totalWeight := 0.0
-			for _, qr := range a.RoundQueries {
-				totalWeight += qr.Value
-			}
-			avgValue := totalWeight / nq
-			expectedGain := avgValue * math.Max(1, nq/5-float64(a.RoundWins))
-
-			if cost <= a.Budget && (cost == 0 || expectedGain > cost) {
-				a.Center = newCenter
-				a.Budget -= cost
-				a.TotalFees += cost
-			}
+		if cost <= a.Budget && (cost == 0 || expectedGain > cost) {
+			a.Center = newCenter
+			a.Budget -= cost
+			a.TotalFees += cost
 		}
 	}
 
-	// --- Price gradient (always applies) ---
+	// --- Price gradient ---
 	targetPrice := 0.0
 	for _, qr := range a.RoundQueries {
 		targetPrice += qr.Value
@@ -190,6 +186,149 @@ func (a *Advertiser) Adapt(lambda float64) {
 	targetPrice /= nq
 	a.Price += lr * (targetPrice - a.Price)
 	a.Price = math.Max(a.Price, 0.01)
+}
+
+// AdaptKeyword does price-only adaptation for the keyword cell.
+func (a *Advertiser) AdaptKeyword() {
+	const lr = 0.02
+	if len(a.RoundQueries) == 0 {
+		return
+	}
+	nq := float64(len(a.RoundQueries))
+	targetPrice := 0.0
+	for _, qr := range a.RoundQueries {
+		targetPrice += qr.Value
+	}
+	targetPrice /= nq
+	a.Price += lr * (targetPrice - a.Price)
+	a.Price = math.Max(a.Price, 0.01)
+}
+
+// --- Keyword Bins ---
+
+// globalKeywordBins maps [clusterIdx][queryIdx] -> advertiser cluster index (nearest centroid).
+var globalKeywordBins [][]int
+
+// computeKeywordBins assigns each query to its nearest advertiser k-means cluster centroid.
+func computeKeywordBins() {
+	// Compute advertiser cluster centroids
+	clusterEmbeddings := make(map[int][][]float64)
+	for _, ad := range advertiserData {
+		clusterEmbeddings[ad.Cluster] = append(clusterEmbeddings[ad.Cluster], ad.Embedding)
+	}
+	centroids := make(map[int][]float64)
+	for c, embs := range clusterEmbeddings {
+		centroids[c] = centroid(embs)
+	}
+
+	globalKeywordBins = make([][]int, len(impressionClusters))
+	for ci, ic := range impressionClusters {
+		globalKeywordBins[ci] = make([]int, len(ic.Queries))
+		for qi, q := range ic.Queries {
+			bestCluster := 0
+			bestDist := math.Inf(1)
+			for c, cen := range centroids {
+				d := squaredDist(q, cen)
+				if d < bestDist {
+					bestDist = d
+					bestCluster = c
+				}
+			}
+			globalKeywordBins[ci][qi] = bestCluster
+		}
+	}
+}
+
+// runKeywordAuctionRound runs a keyword-bin auction: queries mapped to discrete bins,
+// only matching-cluster advertisers compete, pure price ranking, second-price payment.
+func runKeywordAuctionRound(advs []*Advertiser, queries []SampledQuery) (float64, []perQueryResult) {
+	revenue := 0.0
+	var pqResults []perQueryResult
+
+	for _, sq := range queries {
+		q := sq.Embedding
+
+		// Look up keyword bin
+		kwBin := globalKeywordBins[sq.ClusterIdx][sq.QueryIdx]
+
+		// Filter to advertisers in matching cluster
+		var bids []core.CoreBid
+		bidderMap := make(map[string]*Advertiser)
+		for _, adv := range advs {
+			if adv.Cluster == kwBin && adv.Budget > adv.Price && adv.ShouldBid(q) {
+				bids = append(bids, adv.MakeBid())
+				bidderMap[adv.Name] = adv
+			}
+		}
+		if len(bids) == 0 {
+			continue
+		}
+
+		// Pure price auction — no queryEmbedding → RankCoreBids (price ranking)
+		result := core.RunAuction(bids, nil, 0)
+		if result.Winner == nil {
+			continue
+		}
+		winner := bidderMap[result.Winner.Bidder]
+		if winner == nil {
+			continue
+		}
+
+		value := winner.ValueAt(q)
+
+		// maxVal across ALL advertisers (not just bin participants) — measures keyword tax
+		maxVal := 0.0
+		for _, adv := range advs {
+			v := adv.ValueAt(q)
+			if v > maxVal {
+				maxVal = v
+			}
+		}
+
+		// Second-price payment
+		var payment float64
+		if result.RunnerUp != nil {
+			payment = result.RunnerUp.Price
+		} else {
+			payment = winner.Price
+		}
+
+		winner.RoundWins++
+		winner.RoundSpend += payment
+		winner.RoundValueWon += value
+		winner.TotalWins++
+		winner.TotalSpend += payment
+		winner.TotalValueWon += value
+		winner.Budget -= payment
+		revenue += payment
+
+		qType := QueryGeneral
+		if globalQueryTypes != nil && sq.ClusterIdx < len(globalQueryTypes) && sq.QueryIdx < len(globalQueryTypes[sq.ClusterIdx]) {
+			qType = globalQueryTypes[sq.ClusterIdx][sq.QueryIdx]
+		}
+
+		pqResults = append(pqResults, perQueryResult{
+			WinnerValue: value,
+			MaxValue:    maxVal,
+			WinnerName:  winner.Name,
+			QueryType:   qType,
+		})
+
+		// Record query result for winner
+		winner.RoundQueries = append(winner.RoundQueries, queryResult{
+			Query: q, Value: value, Won: true, Payment: payment,
+		})
+
+		// Record for other bidders
+		for name, adv := range bidderMap {
+			if name != winner.Name {
+				adv.RoundQueries = append(adv.RoundQueries, queryResult{
+					Query: q, Value: adv.ValueAt(q), Won: false, Payment: 0,
+				})
+			}
+		}
+	}
+	return revenue, pqResults
 }
 
 // --- Publisher ---
@@ -277,6 +416,51 @@ func computeQueryTypes(valueDecay float64) [][]int {
 // Global query types, set once in main after calibration.
 var globalQueryTypes [][]int
 
+// --- Specialist/Generalist Classification ---
+
+// globalSpecialists maps advertiser name -> true if specialist.
+var globalSpecialists map[string]bool
+
+// classifyAdvertisers labels each advertiser as specialist or generalist.
+// For each advertiser, count queries where they have >50% of the max possible value.
+// The median niche count splits: below-median = specialist, above-median = generalist.
+func classifyAdvertisers(valueDecay float64) {
+	globalSpecialists = make(map[string]bool)
+
+	nicheCounts := make(map[string]int)
+	for _, ad := range advertiserData {
+		count := 0
+		for _, c := range impressionClusters {
+			for _, q := range c.Queries {
+				adVal := ad.MaxValue * math.Exp(-squaredDist(ad.Embedding, q)/valueDecay)
+				maxVal := 0.0
+				for _, other := range advertiserData {
+					v := other.MaxValue * math.Exp(-squaredDist(other.Embedding, q)/valueDecay)
+					if v > maxVal {
+						maxVal = v
+					}
+				}
+				if maxVal > 0 && adVal > 0.5*maxVal {
+					count++
+				}
+			}
+		}
+		nicheCounts[ad.Name] = count
+	}
+
+	// Find median niche count
+	counts := make([]float64, 0, len(nicheCounts))
+	for _, c := range nicheCounts {
+		counts = append(counts, float64(c))
+	}
+	sort.Float64s(counts)
+	median := counts[len(counts)/2]
+
+	for _, ad := range advertiserData {
+		globalSpecialists[ad.Name] = float64(nicheCounts[ad.Name]) <= median
+	}
+}
+
 // --- VCG Auction Round ---
 
 func runAuctionRound(advs []*Advertiser, queries []SampledQuery) (float64, []perQueryResult) {
@@ -308,9 +492,9 @@ func runAuctionRound(advs []*Advertiser, queries []SampledQuery) (float64, []per
 
 		value := winner.ValueAt(q)
 
-		// Find max value across all bidders for this query
+		// Find max value across ALL advertisers (oracle optimal)
 		maxVal := 0.0
-		for _, adv := range bidderMap {
+		for _, adv := range advs {
 			v := adv.ValueAt(q)
 			if v > maxVal {
 				maxVal = v
@@ -555,6 +739,8 @@ type TrialResult struct {
 	IntraClusterVar   float64 // snapshot at end
 	AvgDrift          float64 // snapshot at end
 	ConvergedAtRound  int     // 0 = did not converge (diagnostic only)
+	SpecialistSurplus float64 // avg surplus per specialist per round
+	GeneralistSurplus float64 // avg surplus per generalist per round
 }
 
 const (
@@ -563,10 +749,9 @@ const (
 	impressionsPerRound = 50
 	convergenceEpsilon  = 0.01
 	convergenceWindow   = 5
-	keywordSigma        = 0.20 // tight σ for keyword baseline (same VCG formula)
 )
 
-func runTrial(lambda float64, valueDecay float64, makeAdvs func(rng *rand.Rand, valueDecay float64) []*Advertiser, seed int64) TrialResult {
+func runTrial(lambda float64, valueDecay float64, keywordMode bool, makeAdvs func(rng *rand.Rand, valueDecay float64) []*Advertiser, seed int64) TrialResult {
 	rng := rand.New(rand.NewSource(seed))
 	pub := NewPublisher(seed)
 	advs := makeAdvs(rng, valueDecay)
@@ -587,10 +772,20 @@ func runTrial(lambda float64, valueDecay float64, makeAdvs func(rng *rand.Rand, 
 		}
 
 		queries := pub.SampleImpressions(impressionsPerRound)
-		_, pqResults := runAuctionRound(advs, queries)
+
+		var pqResults []perQueryResult
+		if keywordMode {
+			_, pqResults = runKeywordAuctionRound(advs, queries)
+		} else {
+			_, pqResults = runAuctionRound(advs, queries)
+		}
 
 		for _, adv := range advs {
-			adv.Adapt(lambda)
+			if keywordMode {
+				adv.AdaptKeyword()
+			} else {
+				adv.Adapt(lambda)
+			}
 		}
 
 		// Accumulate eval window data (last evalWindow rounds)
@@ -619,11 +814,34 @@ func runTrial(lambda float64, valueDecay float64, makeAdvs func(rng *rand.Rand, 
 	// Compute metrics
 	totalAdvSurplus := 0.0
 	totalFees := 0.0
+	specSurplus := 0.0
+	genSurplus := 0.0
+	nSpec := 0
+	nGen := 0
 	for _, a := range advs {
-		totalAdvSurplus += a.Surplus()
+		surplus := a.Surplus()
+		totalAdvSurplus += surplus
 		totalFees += a.TotalFees
+		if globalSpecialists != nil {
+			if globalSpecialists[a.Name] {
+				specSurplus += surplus
+				nSpec++
+			} else {
+				genSurplus += surplus
+				nGen++
+			}
+		}
 	}
 	avgSurplusPerRound := totalAdvSurplus / float64(len(advs)) / float64(maxRounds)
+
+	specSurpPerRound := 0.0
+	if nSpec > 0 {
+		specSurpPerRound = specSurplus / float64(nSpec) / float64(maxRounds)
+	}
+	genSurpPerRound := 0.0
+	if nGen > 0 {
+		genSurpPerRound = genSurplus / float64(nGen) / float64(maxRounds)
+	}
 
 	pubRevenue := 0.0
 	for _, a := range advs {
@@ -642,6 +860,8 @@ func runTrial(lambda float64, valueDecay float64, makeAdvs func(rng *rand.Rand, 
 		IntraClusterVar:   intraClusterPosVariance(advs),
 		AvgDrift:          avgDrift(advs),
 		ConvergedAtRound:  convergedAt,
+		SpecialistSurplus: specSurpPerRound,
+		GeneralistSurplus: genSurpPerRound,
 	}
 }
 
@@ -759,41 +979,12 @@ func makeAdvertisers(rng *rand.Rand, valueDecay float64) []*Advertiser {
 		advs[i] = &Advertiser{
 			Name:            d.Name,
 			Cluster:         d.Cluster,
-			FreezePosition:  false,
 			IdealCenter:     ideal,
 			CommittedCenter: vecCopy(center),
 			Center:          center,
 			Price:           jitter(rng, d.BaseBid, d.BaseBid*0.10),
 			Sigma:           clamp(jitter(rng, d.BaseSigma, 0.03), 0.10, 0.75),
 			Budget:          1e9, // effectively infinite — remove budget depletion confound
-			MaxValue:        jitter(rng, d.MaxValue, 1.0),
-			ValueDecay:      valueDecay,
-		}
-	}
-	return advs
-}
-
-// makeKeywordAdvertisers creates advertisers with tight σ and frozen positions.
-// Same VCG scoring formula as embedding cells — just very selective + can't move.
-func makeKeywordAdvertisers(rng *rand.Rand, valueDecay float64) []*Advertiser {
-	advs := make([]*Advertiser, len(advertiserData))
-	noiseScale := 0.02 / math.Sqrt(float64(embeddingDim))
-	for i, d := range advertiserData {
-		ideal := vecCopy(d.Embedding)
-		center := vecCopy(d.Embedding)
-		for j := range center {
-			center[j] += rng.NormFloat64() * noiseScale
-		}
-		advs[i] = &Advertiser{
-			Name:            d.Name,
-			Cluster:         d.Cluster,
-			FreezePosition:  true,
-			IdealCenter:     ideal,
-			CommittedCenter: vecCopy(center),
-			Center:          center,
-			Price:           jitter(rng, d.BaseBid, d.BaseBid*0.10),
-			Sigma:           keywordSigma, // tight σ — same VCG formula, just very selective
-			Budget:          1e9,
 			MaxValue:        jitter(rng, d.MaxValue, 1.0),
 			ValueDecay:      valueDecay,
 		}
@@ -989,6 +1180,8 @@ type CellResult struct {
 	PubRev    []float64
 	Drift     []float64
 	Converged []float64 // round at which converged, 0=never
+	SpecSurp  []float64
+	GenSurp   []float64
 }
 
 func collectCellResult(results []TrialResult) CellResult {
@@ -1001,6 +1194,8 @@ func collectCellResult(results []TrialResult) CellResult {
 		PubRev:    make([]float64, n),
 		Drift:     make([]float64, n),
 		Converged: make([]float64, n),
+		SpecSurp:  make([]float64, n),
+		GenSurp:   make([]float64, n),
 	}
 	for i, r := range results {
 		cr.ValEff[i] = r.ValueEfficiency
@@ -1010,6 +1205,8 @@ func collectCellResult(results []TrialResult) CellResult {
 		cr.PubRev[i] = r.PubRevenue
 		cr.Drift[i] = r.AvgDrift
 		cr.Converged[i] = float64(r.ConvergedAtRound)
+		cr.SpecSurp[i] = r.SpecialistSurplus
+		cr.GenSurp[i] = r.GeneralistSurplus
 	}
 	return cr
 }
@@ -1019,6 +1216,8 @@ func printCellResult(cr CellResult) {
 	fmt.Printf("    Boundary diversity:  %s\n", fmtStats(cr.BoundDiv))
 	fmt.Printf("    Win diversity:       %s\n", fmtStats(cr.WinDiv))
 	fmt.Printf("    Avg surplus/round:   %s\n", fmtStats(cr.AdvSurp))
+	fmt.Printf("    Specialist surplus:  %s\n", fmtStats(cr.SpecSurp))
+	fmt.Printf("    Generalist surplus:  %s\n", fmtStats(cr.GenSurp))
 	fmt.Printf("    Pub revenue/round:   %s\n", fmtStats(cr.PubRev))
 	fmt.Printf("    Avg drift:           %s\n", fmtStats(cr.Drift))
 
@@ -1035,18 +1234,18 @@ func printCellResult(cr CellResult) {
 // --- Experiment 2: Cell A — Keyword Baseline ---
 
 func runKeywordBaseline(valueDecay float64) CellResult {
-	name := fmt.Sprintf("Experiment 2: Cell A — Keyword Baseline (σ=%.2f, frozen)", keywordSigma)
+	name := "Experiment 2: Cell A — Keyword Bins (discrete bins, price-only)"
 	fmt.Printf("\n%s\n%s\n", name, strings.Repeat("=", len(name)))
 
 	const trials = 50
 	results := make([]TrialResult, trials)
 	for i := range results {
-		results[i] = runTrial(0, valueDecay, makeKeywordAdvertisers, int64(i*7919+42))
+		results[i] = runTrial(0, valueDecay, true, makeAdvertisers, int64(i*7919+42))
 	}
 
 	cr := collectCellResult(results)
-	fmt.Printf("\n  Trials: %d  |  σ=%.2f, frozen positions  |  λ=0  |  %d rounds\n",
-		trials, keywordSigma, maxRounds)
+	fmt.Printf("\n  Trials: %d  |  keyword bins, price-only  |  %d rounds\n",
+		trials, maxRounds)
 	printCellResult(cr)
 	return cr
 }
@@ -1060,11 +1259,11 @@ func runEmbeddingsNoFees(valueDecay float64) CellResult {
 	const trials = 50
 	results := make([]TrialResult, trials)
 	for i := range results {
-		results[i] = runTrial(0, valueDecay, makeAdvertisers, int64(i*7919+42))
+		results[i] = runTrial(0, valueDecay, false, makeAdvertisers, int64(i*7919+42))
 	}
 
 	cr := collectCellResult(results)
-	fmt.Printf("\n  Trials: %d  |  Normal σ, free positions  |  λ=0  |  %d rounds\n",
+	fmt.Printf("\n  Trials: %d  |  embedding scoring, free σ/position  |  λ=0  |  %d rounds\n",
 		trials, maxRounds)
 	printCellResult(cr)
 	return cr
@@ -1088,7 +1287,7 @@ func runEmbeddingsWithFees(valueDecay float64) (CellResult, float64) {
 	for li, lambda := range lambdas {
 		trialResults := make([]TrialResult, trials)
 		for i := range trialResults {
-			trialResults[i] = runTrial(lambda, valueDecay, makeAdvertisers, int64(i*7919+42))
+			trialResults[i] = runTrial(lambda, valueDecay, false, makeAdvertisers, int64(i*7919+42))
 		}
 		entries[li] = sweepEntry{Lambda: lambda, Cell: collectCellResult(trialResults)}
 	}
@@ -1146,6 +1345,8 @@ func runComparison(cellA, cellC, cellD CellResult, optLambda float64) {
 		{"Boundary diversity", cellA.BoundDiv, cellC.BoundDiv, cellD.BoundDiv, "%.4f"},
 		{"Win diversity", cellA.WinDiv, cellC.WinDiv, cellD.WinDiv, "%.4f"},
 		{"Avg surplus/round", cellA.AdvSurp, cellC.AdvSurp, cellD.AdvSurp, "%.4f"},
+		{"Specialist surplus", cellA.SpecSurp, cellC.SpecSurp, cellD.SpecSurp, "%.4f"},
+		{"Generalist surplus", cellA.GenSurp, cellC.GenSurp, cellD.GenSurp, "%.4f"},
 		{"Pub revenue/round", cellA.PubRev, cellC.PubRev, cellD.PubRev, "%.2f"},
 		{"Avg drift", cellA.Drift, cellC.Drift, cellD.Drift, "%.4f"},
 	}
@@ -1202,6 +1403,37 @@ func runComparison(cellA, cellC, cellD CellResult, optLambda float64) {
 	} else {
 		fmt.Println("No statistically significant differences detected between cells.")
 	}
+
+	// Specialist/Generalist analysis
+	fmt.Printf("\n  Specialist vs Generalist analysis:\n")
+	mssA, _ := sampleMeanStd(cellA.SpecSurp)
+	mssC, _ := sampleMeanStd(cellC.SpecSurp)
+	mgsA, _ := sampleMeanStd(cellA.GenSurp)
+	mgsC, _ := sampleMeanStd(cellC.GenSurp)
+	_, pSpecAC := welchT(cellA.SpecSurp, cellC.SpecSurp)
+	_, pGenAC := welchT(cellA.GenSurp, cellC.GenSurp)
+
+	if mssC > mssA && pSpecAC < 0.05 {
+		fmt.Printf("    Embeddings significantly INCREASE specialist surplus (%.4f → %.4f, %s)\n",
+			mssA, mssC, sigStars(pSpecAC))
+	} else if mssC < mssA && pSpecAC < 0.05 {
+		fmt.Printf("    Embeddings significantly DECREASE specialist surplus (%.4f → %.4f, %s)\n",
+			mssA, mssC, sigStars(pSpecAC))
+	} else {
+		fmt.Printf("    No significant change in specialist surplus (%.4f → %.4f, %s)\n",
+			mssA, mssC, sigStars(pSpecAC))
+	}
+
+	if mgsC > mgsA && pGenAC < 0.05 {
+		fmt.Printf("    Embeddings significantly INCREASE generalist surplus (%.4f → %.4f, %s)\n",
+			mgsA, mgsC, sigStars(pGenAC))
+	} else if mgsC < mgsA && pGenAC < 0.05 {
+		fmt.Printf("    Embeddings significantly DECREASE generalist surplus (%.4f → %.4f, %s)\n",
+			mgsA, mgsC, sigStars(pGenAC))
+	} else {
+		fmt.Printf("    No significant change in generalist surplus (%.4f → %.4f, %s)\n",
+			mgsA, mgsC, sigStars(pGenAC))
+	}
 }
 
 // --- Main ---
@@ -1213,7 +1445,33 @@ func main() {
 	// Exp 1: Calibrate value decay + compute query types
 	valueDecay := runCalibration()
 
-	// Exp 2: Cell A — keyword baseline (tight σ, frozen positions)
+	// Compute keyword bins and specialist classification
+	computeKeywordBins()
+	classifyAdvertisers(valueDecay)
+
+	// Print keyword bin diagnostics
+	fmt.Printf("\n  Keyword bin assignments:\n")
+	for ci, ic := range impressionClusters {
+		for qi := range ic.Queries {
+			label := ""
+			if qi < len(ic.Labels) {
+				label = ic.Labels[qi]
+			}
+			fmt.Printf("    cluster=%d query=%d bin=%d  %s\n", ci, qi, globalKeywordBins[ci][qi], label)
+		}
+	}
+
+	// Print specialist/generalist classification
+	fmt.Printf("\n  Specialist/Generalist classification (median-split on niche query count):\n")
+	for _, ad := range advertiserData {
+		role := "generalist"
+		if globalSpecialists[ad.Name] {
+			role = "specialist"
+		}
+		fmt.Printf("    %-20s → %s\n", ad.Name, role)
+	}
+
+	// Exp 2: Cell A — keyword baseline (discrete bins, price-only)
 	cellA := runKeywordBaseline(valueDecay)
 
 	// Exp 3: Cell C — embeddings, no fees
