@@ -4,6 +4,13 @@ Core auction logic and TEE (Trusted Execution Environment) enclave implementatio
 
 https://www.cloudx.ai/
 
+## Embedding-Space Auction Fork
+
+This fork adds optional embedding-space scoring to the core auction, implementing `score = log(price) - distance²/σ²`. See the open letter and full series for context:
+
+- [An Open Letter to CloudX](https://june.kim/letter-to-cloudx)
+- [Power Diagrams for Ad Auctions](https://june.kim/power-diagrams-ad-auctions) (series start)
+
 ## Overview
 
 This repository contains the core auction functionality that has been extracted from the main CloudX platform for independent versioning and reusability. It includes:
