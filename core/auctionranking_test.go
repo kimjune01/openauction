@@ -150,6 +150,61 @@ func TestRankCoreBids_MultipleTieLevels(t *testing.T) {
 	check.Equal(t, "bidder_e", result2.SortedBidders[4])
 }
 
+// --- RankScoredBids tests ---
+
+func TestRankScoredBids_BasicScoreRanking(t *testing.T) {
+	bids := []ScoredBid{
+		{CoreBid: CoreBid{ID: "b1", Bidder: "A", Price: 1.0}, Score: 5.0},
+		{CoreBid: CoreBid{ID: "b2", Bidder: "B", Price: 2.0}, Score: 10.0},
+		{CoreBid: CoreBid{ID: "b3", Bidder: "C", Price: 3.0}, Score: 7.0},
+	}
+	result := RankScoredBids(bids, nil)
+
+	check.Equal(t, 3, len(result.SortedBidders))
+	check.Equal(t, "B", result.SortedBidders[0])  // Highest score (10)
+	check.Equal(t, "C", result.SortedBidders[1])  // Middle score (7)
+	check.Equal(t, "A", result.SortedBidders[2])   // Lowest score (5)
+}
+
+func TestRankScoredBids_TieBreaking(t *testing.T) {
+	bids := []ScoredBid{
+		{CoreBid: CoreBid{ID: "b1", Bidder: "A", Price: 1.0}, Score: 5.0},
+		{CoreBid: CoreBid{ID: "b2", Bidder: "B", Price: 2.0}, Score: 5.0},
+	}
+
+	mock := &mockRandSource{sequence: []int{0}}
+	result := RankScoredBids(bids, mock)
+
+	check.Equal(t, 2, len(result.SortedBidders))
+	// With mock returning 0, swap happens → B first
+	check.Equal(t, "B", result.SortedBidders[0])
+	check.Equal(t, "A", result.SortedBidders[1])
+}
+
+func TestRankScoredBids_PerBidderHighestByScore(t *testing.T) {
+	bids := []ScoredBid{
+		{CoreBid: CoreBid{ID: "b1", Bidder: "A", Price: 1.0}, Score: 3.0},
+		{CoreBid: CoreBid{ID: "b2", Bidder: "A", Price: 2.0}, Score: 8.0}, // Higher score for A
+		{CoreBid: CoreBid{ID: "b3", Bidder: "B", Price: 5.0}, Score: 6.0},
+	}
+
+	result := RankScoredBids(bids, nil)
+
+	check.Equal(t, 2, len(result.SortedBidders))
+	check.Equal(t, "A", result.SortedBidders[0]) // Score 8
+	check.Equal(t, "B", result.SortedBidders[1]) // Score 6
+	check.Equal(t, 2.0, result.HighestBids["A"].Price) // The bid with higher score
+}
+
+func TestRankScoredBids_EmptyInput(t *testing.T) {
+	result := RankScoredBids([]ScoredBid{}, nil)
+
+	check.NotNil(t, result)
+	check.Equal(t, 0, len(result.SortedBidders))
+	check.Equal(t, 0, len(result.HighestBids))
+	check.Equal(t, 0, len(result.Ranks))
+}
+
 func TestRankCoreBids_FourWayTie_WinnerRunnerUp(t *testing.T) {
 	bids := []CoreBid{
 		{ID: "bid1", Bidder: "bidder_a", Price: 5.00},

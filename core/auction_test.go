@@ -261,3 +261,101 @@ func TestRunAuction_MixedPriceValidation(t *testing.T) {
 	check.True(t, rejectedIDs["bid3"])
 	check.True(t, rejectedIDs["bid4"])
 }
+
+// --- Embedding auction tests ---
+
+func TestRunAuction_BackwardCompat_NilQuery(t *testing.T) {
+	// No query embedding → identical to current behavior (pure price ranking)
+	bids := []CoreBid{
+		{ID: "bid1", Bidder: "bidder_a", Price: 2.0},
+		{ID: "bid2", Bidder: "bidder_b", Price: 3.0},
+	}
+
+	result := RunAuction(bids, nil, 0.0)
+
+	check.NotNil(t, result)
+	check.Equal(t, "bidder_b", result.Winner.Bidder)
+	check.Equal(t, 3.0, result.Winner.Price)
+	check.Equal(t, "bidder_a", result.RunnerUp.Bidder)
+}
+
+func TestRunAuction_CloserBidWins(t *testing.T) {
+	// Same price, different distances → closer bid wins
+	query := []float64{0.0, 0.0}
+	bids := []CoreBid{
+		{ID: "bid1", Bidder: "bidder_far", Price: 2.0, Embedding: []float64{3.0, 0.0}, Sigma: 1.0},
+		{ID: "bid2", Bidder: "bidder_close", Price: 2.0, Embedding: []float64{0.1, 0.0}, Sigma: 1.0},
+	}
+
+	result := RunAuction(bids, nil, 0.0, query)
+
+	check.NotNil(t, result)
+	check.Equal(t, "bidder_close", result.Winner.Bidder)
+	check.Equal(t, "bidder_far", result.RunnerUp.Bidder)
+}
+
+func TestRunAuction_PriceVsProximityTradeoff(t *testing.T) {
+	// Expensive-far vs cheap-close: proximity wins when σ is small enough
+	query := []float64{0.0, 0.0}
+	bids := []CoreBid{
+		{ID: "bid1", Bidder: "expensive_far", Price: 5.0, Embedding: []float64{2.0, 0.0}, Sigma: 0.5},
+		{ID: "bid2", Bidder: "cheap_close", Price: 2.0, Embedding: []float64{0.1, 0.0}, Sigma: 0.5},
+	}
+
+	result := RunAuction(bids, nil, 0.0, query)
+
+	check.NotNil(t, result)
+	// With σ=0.5: expensive_far score = log(5) - 4/0.25 = 1.609 - 16 = -14.39
+	//              cheap_close score = log(2) - 0.01/0.25 = 0.693 - 0.04 = 0.653
+	check.Equal(t, "cheap_close", result.Winner.Bidder)
+}
+
+func TestRunAuction_SigmaZeroDegeneracy(t *testing.T) {
+	// σ=0 with embeddings → falls back to pure price ranking
+	query := []float64{0.0, 0.0}
+	bids := []CoreBid{
+		{ID: "bid1", Bidder: "bidder_a", Price: 2.0, Embedding: []float64{10.0, 10.0}, Sigma: 0.0},
+		{ID: "bid2", Bidder: "bidder_b", Price: 3.0, Embedding: []float64{0.1, 0.1}, Sigma: 0.0},
+	}
+
+	result := RunAuction(bids, nil, 0.0, query)
+
+	check.NotNil(t, result)
+	// σ=0 means score = log(price), so higher price wins
+	check.Equal(t, "bidder_b", result.Winner.Bidder)
+	check.Equal(t, 3.0, result.Winner.Price)
+}
+
+func TestRunAuction_MixedEmbeddings(t *testing.T) {
+	// Some bids with embeddings, some without → all participate
+	query := []float64{0.0, 0.0}
+	bids := []CoreBid{
+		{ID: "bid1", Bidder: "with_embedding", Price: 2.0, Embedding: []float64{0.1, 0.0}, Sigma: 1.0},
+		{ID: "bid2", Bidder: "without_embedding", Price: 3.0}, // No embedding → score = log(3)
+	}
+
+	result := RunAuction(bids, nil, 0.0, query)
+
+	check.NotNil(t, result)
+	// with_embedding score = log(2) - 0.01 = 0.683
+	// without_embedding score = log(3) = 1.099
+	// without_embedding wins on price alone since it has no distance penalty
+	check.Equal(t, "without_embedding", result.Winner.Bidder)
+}
+
+func TestRunAuction_FloorAppliesToPrice_NotScore(t *testing.T) {
+	// Floor enforcement is on price, not score
+	query := []float64{0.0, 0.0}
+	bids := []CoreBid{
+		{ID: "bid1", Bidder: "above_floor", Price: 2.0, Embedding: []float64{0.0, 0.0}, Sigma: 1.0},
+		{ID: "bid2", Bidder: "below_floor", Price: 0.5, Embedding: []float64{0.0, 0.0}, Sigma: 1.0},
+	}
+
+	result := RunAuction(bids, nil, 1.0, query) // floor = 1.0
+
+	check.NotNil(t, result)
+	check.Equal(t, 1, len(result.EligibleBids))
+	check.Equal(t, "above_floor", result.Winner.Bidder)
+	check.Equal(t, 1, len(result.FloorRejectedBidIDs))
+	check.Equal(t, "bid2", result.FloorRejectedBidIDs[0])
+}

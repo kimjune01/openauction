@@ -32,6 +32,94 @@ func (cryptoRandSource) Intn(n int) int {
 // defaultRandSource provides a cryptographically secure random source for production
 var defaultRandSource RandSource = cryptoRandSource{}
 
+// ScoredBid pairs a CoreBid with a pre-computed embedding score.
+type ScoredBid struct {
+	CoreBid
+	Score float64
+}
+
+// RankScoredBids ranks bids by Score (descending) instead of Price.
+// Per-bidder highest is chosen by Score. Tie-breaking uses random shuffle.
+func RankScoredBids(bids []ScoredBid, randSource RandSource) *CoreRankingResult {
+	if len(bids) == 0 {
+		return &CoreRankingResult{
+			Ranks:         make(map[string]int),
+			HighestBids:   make(map[string]*CoreBid),
+			SortedBidders: make([]string, 0),
+		}
+	}
+
+	type ScoredEntry struct {
+		bidder string
+		bid    *CoreBid
+		score  float64
+	}
+
+	// Find highest-score bid per bidder
+	bidderMap := make(map[string]*ScoredEntry)
+	bidderOrder := make([]string, 0, len(bids))
+	seenBidders := make(map[string]bool)
+
+	for i := range bids {
+		sb := &bids[i]
+		if !seenBidders[sb.Bidder] {
+			bidderOrder = append(bidderOrder, sb.Bidder)
+			seenBidders[sb.Bidder] = true
+		}
+		existing, exists := bidderMap[sb.Bidder]
+		if !exists || sb.Score > existing.score {
+			bid := sb.CoreBid // copy
+			bidderMap[sb.Bidder] = &ScoredEntry{bidder: sb.Bidder, bid: &bid, score: sb.Score}
+		}
+	}
+
+	entries := make([]ScoredEntry, 0, len(bidderOrder))
+	for _, bidder := range bidderOrder {
+		entries = append(entries, *bidderMap[bidder])
+	}
+
+	// Sort by score descending
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].score > entries[j].score
+	})
+
+	if randSource == nil {
+		randSource = defaultRandSource
+	}
+
+	// Break ties randomly (same Fisher-Yates as RankCoreBids)
+	i := 0
+	for i < len(entries) {
+		score := entries[i].score
+		j := i + 1
+		for j < len(entries) && entries[j].score == score {
+			j++
+		}
+		if j-i > 1 {
+			for k := j - 1; k > i; k-- {
+				randIdx := i + randSource.Intn(k-i+1)
+				entries[k], entries[randIdx] = entries[randIdx], entries[k]
+			}
+		}
+		i = j
+	}
+
+	result := &CoreRankingResult{
+		Ranks:         make(map[string]int, len(entries)),
+		HighestBids:   make(map[string]*CoreBid, len(entries)),
+		SortedBidders: make([]string, len(entries)),
+	}
+
+	for rank, entry := range entries {
+		rankValue := rank + 1
+		result.Ranks[entry.bidder] = rankValue
+		result.HighestBids[entry.bidder] = entry.bid
+		result.SortedBidders[rank] = entry.bidder
+	}
+
+	return result
+}
+
 func RankCoreBids(bids []CoreBid, randSource RandSource) *CoreRankingResult {
 	if len(bids) == 0 {
 		return &CoreRankingResult{

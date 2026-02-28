@@ -8,6 +8,11 @@ type CoreBid struct {
 	Currency string  `json:"currency"`
 	DealID   string  `json:"deal_id,omitempty"`
 	BidType  string  `json:"bid_type,omitempty"`
+
+	// Embedding-space auction fields (all optional; zero values = pure price bid)
+	Embedding      []float64 `json:"embedding,omitempty"`
+	EmbeddingModel string    `json:"embedding_model,omitempty"`
+	Sigma          float64   `json:"sigma,omitempty"`
 }
 
 // CoreRankingResult contains the ranked bidders and their highest bids.

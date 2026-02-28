@@ -22,7 +22,10 @@ func validateBidPrices(bids []CoreBid) (valid []CoreBid, rejectedBidIDs []string
 // Parameters:
 //   - bids: Input bids (should already be decrypted if from TEE)
 //   - adjustmentFactors: Per-bidder adjustment multipliers
-//   - bidFloors: Per-bidder floor prices
+//   - bidFloor: Floor price (applies to price, not score)
+//   - queryEmbedding: (optional) If provided, enables embedding-space scoring.
+//     Bids with embeddings are scored as log(price) - distance²/σ² and ranked by score.
+//     Bids without embeddings fall back to log(price).
 //
 // Returns:
 //   - AuctionResult containing winner, runner-up, eligible bids, rejected bids, and full ranking
@@ -30,13 +33,14 @@ func validateBidPrices(bids []CoreBid) (valid []CoreBid, rejectedBidIDs []string
 // Processing flow:
 //  1. Validate bid prices (reject non-positive prices)
 //  2. Apply bid adjustment factors (multipliers per bidder)
-//  3. Enforce floor price
-//  4. Rank eligible bids by price with random tie-breaking
+//  3. Enforce floor price (on price, not score)
+//  4. If queryEmbedding provided: compute scores, rank by score; otherwise: rank by price
 //  5. Extract winner and runner-up from ranking
 func RunAuction(
 	bids []CoreBid,
 	adjustmentFactors map[string]float64,
 	bidFloor float64,
+	queryEmbedding ...[]float64,
 ) *AuctionResult {
 	// Step 1: Validate bid prices
 	validBids, priceRejectedBids := validateBidPrices(bids)
@@ -47,11 +51,26 @@ func RunAuction(
 		adjustedBids = ApplyBidAdjustmentFactors(validBids, adjustmentFactors)
 	}
 
-	// Step 3: Enforce floor price
+	// Step 3: Enforce floor price (on price, not score)
 	eligibleBids, floorRejectedBids := EnforceBidFloor(adjustedBids, bidFloor)
 
-	// Step 4: Rank eligible bids by price with random tie-breaking
-	ranking := RankCoreBids(eligibleBids, defaultRandSource)
+	// Step 4: Rank eligible bids
+	var ranking *CoreRankingResult
+	if len(queryEmbedding) > 0 && len(queryEmbedding[0]) > 0 {
+		// Embedding-space scoring path
+		qe := queryEmbedding[0]
+		scoredBids := make([]ScoredBid, len(eligibleBids))
+		for i, bid := range eligibleBids {
+			scoredBids[i] = ScoredBid{
+				CoreBid: bid,
+				Score:   ComputeEmbeddingScore(bid.Price, bid.Embedding, bid.Sigma, qe),
+			}
+		}
+		ranking = RankScoredBids(scoredBids, defaultRandSource)
+	} else {
+		// Pure price ranking path (unchanged)
+		ranking = RankCoreBids(eligibleBids, defaultRandSource)
+	}
 
 	// Step 5: Extract winner and runner-up from ranking
 	var winner, runnerUp *CoreBid
