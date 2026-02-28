@@ -1,64 +1,27 @@
-# CloudX's Open Auction
+# Embedding-Space Auction Fork
 
-Core auction logic and TEE (Trusted Execution Environment) enclave implementation for CloudX auctions.
+This fork of [CloudX's OpenAuction](https://github.com/cloudx-io/openauction) adds optional embedding-space scoring to the core auction:
 
-https://www.cloudx.ai/
-
-## Embedding-Space Auction Fork
-
-This fork adds optional embedding-space scoring to the core auction, implementing `score = log(price) - distance²/σ²`. See the open letter and full series for context:
-
-- [An Open Letter to CloudX](https://june.kim/letter-to-cloudx)
-- [Power Diagrams for Ad Auctions](https://june.kim/power-diagrams-ad-auctions) (series start)
-
-## Overview
-
-This repository contains the core auction functionality that has been extracted from the main CloudX platform for independent versioning and reusability. It includes:
-
-- **`core/`**: Core auction logic including bid ranking, adjustments, and floor enforcement
-- **`enclaveapi/`**: API types for TEE enclave communication
-- **`enclave/`**: AWS Nitro Enclave implementation for secure auction processing
-
-## Usage
-
-### Importing in Go
-
-```go
-import (
-    "github.com/cloudx-io/openauction/core"
-    "github.com/cloudx-io/openauction/enclaveapi"
-    "github.com/cloudx-io/openauction/enclave"
-)
+```
+score = log(price) - distance² / σ²
 ```
 
-### Example: Ranking Bids
+Bids carry three optional fields — `embedding`, `embedding_model`, `sigma` — passed to `RunAuction` as a variadic query embedding. Bids without embeddings fall back to pure price ranking. Existing callers compile unchanged.
 
-```go
-bids := []core.CoreBid{
-    {ID: "1", Bidder: "bidder-a", Price: 2.5, Currency: "USD"},
-    {ID: "2", Bidder: "bidder-b", Price: 3.0, Currency: "USD"},
-}
+For context: [An Open Letter to CloudX](https://june.kim/letter-to-cloudx) · [Power Diagrams for Ad Auctions](https://june.kim/power-diagrams-ad-auctions) (series start)
 
-// RankCoreBids accepts a RandSource for tie-breaking
-// Pass nil to use crypto/rand (default, production behavior)
-result := core.RankCoreBids(bids, nil)
-fmt.Printf("Winner ID: %s, Price: %.2f\n", result.HighestBids[result.SortedBidders[0]].ID, result.HighestBids[result.SortedBidders[0]].Price)
+## Simulation
+
+`cmd/simulate/` runs a multi-agent market simulation validating that relocation fees (`λ · ||c_new - c_old||²`) stabilize advertiser positions in embedding space. See [It Costs Money to Move](https://june.kim/relocation-fees).
+
+```bash
+go run ./cmd/simulate/
 ```
-
-**Tie-Breaking**: When multiple bids have the same price, they are randomly shuffled using cryptographically secure randomness (`crypto/rand`). This ensures fairness in tie scenarios. For testing purposes, you can inject a custom `RandSource` implementation into `RankCoreBids` to make tie-breaking deterministic.
 
 ## Development
 
-### Running Tests
+See the [upstream README](https://github.com/cloudx-io/openauction) for build, test, and enclave documentation.
 
 ```bash
 go test ./...
-```
-
-### Building the Enclave
-
-The enclave binary can be built using the Dockerfile:
-
-```bash
-docker build -f enclave/Dockerfile -t auction-enclave .
 ```
