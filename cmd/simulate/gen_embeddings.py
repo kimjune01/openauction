@@ -3,13 +3,13 @@
 # requires-python = ">=3.10"
 # dependencies = ["fastembed"]
 # ///
-"""Generate embeddings for auction simulation v3.1 (methodology fixes).
+"""Generate embeddings for auction simulation v3.3 (tighter specialist clustering).
 
-Key changes from v3:
-- K-means clustering of advertisers by actual embedding proximity
-- Expanded query set (62 queries, up from 38)
-- Query types computed at runtime in Go (not hardcoded)
-- Labels written to embeddings.go for display
+Key changes from v3.2:
+- Rewritten advertiser descriptions share heavy base phrases within each cluster
+- Niche is a modifier, not a replacement — targets intra-cluster cosine > 0.80
+- Makes keyword bins honestly coarse (close specialists land in same bin naturally)
+- Makes embedding separation harder (real work to distinguish near-miss specialists)
 
 Uses BAAI/bge-small-en-v1.5 (384D) via fastembed.
 """
@@ -20,28 +20,28 @@ from fastembed import TextEmbedding
 # --- Advertisers ---
 # Each entry: (name, description, max_value, base_bid, base_sigma, base_budget)
 ADVERTISERS = [
-    # Physical Therapy variants (5)
-    ("ClimbingPT", "physical therapy for rock climbers finger pulley A2 injury crimp rehab bouldering", 10.0, 3.5, 0.45, 6000),
-    ("SportsPT", "sports physical therapy ACL recovery athletic injury return to play", 10.0, 3.5, 0.45, 6000),
-    ("PelvicFloorPT", "pelvic floor physical therapy postpartum incontinence diastasis recti women's health", 9.0, 3.0, 0.45, 5500),
-    ("PediatricPT", "pediatric physical therapy child motor development cerebral palsy early intervention", 8.0, 2.8, 0.45, 5000),
-    ("GeneralPT", "physical therapy rehabilitation pain management back pain recovery", 8.0, 3.0, 0.50, 6000),
+    # Physical Therapy variants (5) — heavy shared base, niche modifier at end
+    ("ClimbingPT", "licensed physical therapist providing rehabilitation exercise therapy injury recovery specializing in rock climbing finger pulley", 10.0, 3.5, 0.45, 6000),
+    ("SportsPT", "licensed physical therapist providing rehabilitation exercise therapy injury recovery specializing in sports ACL athletic", 10.0, 3.5, 0.45, 6000),
+    ("PelvicFloorPT", "licensed physical therapist providing rehabilitation exercise therapy injury recovery specializing in pelvic floor postpartum", 9.0, 3.0, 0.45, 5500),
+    ("PediatricPT", "licensed physical therapist providing rehabilitation exercise therapy injury recovery specializing in pediatric child motor", 8.0, 2.8, 0.45, 5000),
+    ("GeneralPT", "licensed physical therapist providing rehabilitation exercise therapy injury recovery specializing in back pain general wellness", 8.0, 3.0, 0.50, 6000),
 
-    # Fitness Coaching variants (4)
-    ("ClimbingCoach", "rock climbing coaching technique bouldering training movement skill beta", 9.0, 3.2, 0.45, 5500),
-    ("RunningCoach", "marathon running coach 5k training plan race pace interval speed", 9.0, 3.2, 0.45, 5500),
-    ("CrossFitCoach", "CrossFit coaching WOD functional fitness Olympic lifting competition prep", 9.0, 3.2, 0.45, 5500),
-    ("PersonalTrainer", "personal trainer fitness workout strength training exercise coaching", 8.0, 3.0, 0.50, 5500),
+    # Fitness Coaching variants (4) — heavy shared base, niche modifier at end
+    ("ClimbingCoach", "certified fitness coach offering training workout programs and coaching specializing in rock climbing bouldering", 9.0, 3.2, 0.45, 5500),
+    ("RunningCoach", "certified fitness coach offering training workout programs and coaching specializing in marathon running race prep", 9.0, 3.2, 0.45, 5500),
+    ("CrossFitCoach", "certified fitness coach offering training workout programs and coaching specializing in CrossFit functional fitness", 9.0, 3.2, 0.45, 5500),
+    ("PersonalTrainer", "certified fitness coach offering training workout programs and coaching specializing in personal strength training", 8.0, 3.0, 0.50, 5500),
 
-    # Nutrition variants (4)
-    ("SportsDietitian", "sports dietitian endurance athlete fueling race day nutrition carb loading", 9.0, 3.0, 0.45, 5500),
-    ("GutHealth", "gut health nutritionist SIBO IBS microbiome digestive wellness elimination diet", 8.0, 2.8, 0.45, 5000),
-    ("WeightLossCoach", "weight loss nutritionist calorie deficit macro counting portion control meal plan", 9.0, 3.0, 0.45, 5500),
-    ("GeneralNutritionist", "registered dietitian nutrition counseling healthy eating balanced diet meal planning", 7.0, 2.5, 0.50, 5000),
+    # Nutrition variants (4) — heavy shared base, niche modifier at end
+    ("SportsDietitian", "registered dietitian providing nutrition counseling meal planning and diet guidance specializing in sports athletes endurance", 9.0, 3.0, 0.45, 5500),
+    ("GutHealth", "registered dietitian providing nutrition counseling meal planning and diet guidance specializing in gut health IBS digestive", 8.0, 2.8, 0.45, 5000),
+    ("WeightLossCoach", "registered dietitian providing nutrition counseling meal planning and diet guidance specializing in weight loss calorie deficit", 9.0, 3.0, 0.45, 5500),
+    ("GeneralNutritionist", "registered dietitian providing nutrition counseling meal planning and diet guidance specializing in healthy eating balanced", 7.0, 2.5, 0.50, 5000),
 
-    # Tutoring variants (2)
-    ("ADHDMathTutor", "math tutoring for ADHD students hands-on learning executive function support", 8.0, 2.8, 0.45, 4500),
-    ("GeneralMathTutor", "math tutoring algebra calculus SAT prep test preparation homework help", 7.0, 2.5, 0.50, 4500),
+    # Tutoring variants (2) — heavy shared base, niche modifier at end
+    ("ADHDMathTutor", "experienced math tutor providing tutoring lessons homework help and academic support for students with ADHD attention focus", 8.0, 2.8, 0.45, 4500),
+    ("GeneralMathTutor", "experienced math tutor providing tutoring lessons homework help and academic support for students SAT test prep algebra calculus", 7.0, 2.5, 0.50, 4500),
 ]
 
 # --- Impression query clusters (expanded: 62 queries) ---

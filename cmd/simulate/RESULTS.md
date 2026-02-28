@@ -794,3 +794,207 @@ Use embeddings for candidate retrieval (filter to relevant advertisers)
 but use simpler scoring within the relevant set. Or: the continuous
 scoring formula needs to weight distance more heavily relative to price
 so that relevance dominates.
+
+---
+
+# v3.3 Simulation Results (2026-02-28)
+
+Code: `gen_embeddings.py` + `main.go` — tighter specialist clustering
+
+## What changed from v3.2
+
+v3.2 used semantically distinct advertiser descriptions. The PT cluster
+had intra-cluster cosines ranging 0.586–0.784. The tutoring pair didn't
+cluster together (ADHDMathTutor landed in coaching cluster,
+GeneralMathTutor in nutrition/misc).
+
+v3.3 rewrites descriptions so within-cluster specialists share heavy
+domain language and differ only on their niche modifier:
+
+- Base: "licensed physical therapist providing rehabilitation exercise
+  therapy injury recovery specializing in ..."
+- Modifier: "rock climbing finger pulley" / "sports ACL athletic" / etc.
+
+This targets intra-cluster cosine > 0.80, making:
+1. k-means bins honestly coarse (close specialists land in same bin)
+2. Embedding separation honestly hard (real work to distinguish near-misses)
+
+## Clustering results
+
+All 4 clusters correct. Tutoring pair clusters together (c3).
+
+Intra-cluster cosine ranges:
+- PT (c1): 0.759–0.875 (22/23 pairs > 0.80, only ClimbingPT↔PelvicFloorPT at 0.759)
+- Coaching (c0): 0.815–0.888 (all > 0.80)
+- Nutrition (c2): 0.852–0.937 (all > 0.80)
+- Tutoring (c3): 0.800 (at threshold)
+
+Cross-cluster nearest: ClimbingCoach↔ClimbingPT at 0.755 (below all
+intra-cluster pairs except 1).
+
+## Specialist/Generalist classification
+
+Same median-split on niche query count:
+
+| Advertiser | Role |
+|---|---|
+| PediatricPT | specialist |
+| GeneralPT | specialist |
+| CrossFitCoach | specialist |
+| PersonalTrainer | specialist |
+| GutHealth | specialist |
+| GeneralNutritionist | specialist |
+| ADHDMathTutor | specialist |
+| GeneralMathTutor | specialist |
+| ClimbingPT | generalist |
+| SportsPT | generalist |
+| PelvicFloorPT | generalist |
+| ClimbingCoach | generalist |
+| RunningCoach | generalist |
+| SportsDietitian | generalist |
+| WeightLossCoach | generalist |
+
+## Results
+
+### Cell A — Keyword Bins
+
+| Metric | Mean | Std |
+|---|---|---|
+| Value efficiency | 0.8376 | 0.0185 |
+| Boundary diversity | 0.8071 | 0.0322 |
+| Win diversity | 0.8118 | 0.0272 |
+| Avg surplus/round | -1.3950 | 0.1768 |
+| Specialist surplus | -0.5437 | 0.5187 |
+| Generalist surplus | -2.3680 | 0.5945 |
+| Pub revenue/round | 73.05 | 1.87 |
+
+All 50 trials converged.
+
+### Cell C — Embeddings, No Fees
+
+| Metric | Mean | Std |
+|---|---|---|
+| Value efficiency | 0.7716 | 0.0283 |
+| Boundary diversity | 0.7245 | 0.0542 |
+| Win diversity | 0.7615 | 0.0509 |
+| Avg surplus/round | -1.3057 | 0.2399 |
+| Specialist surplus | -0.4025 | 0.4986 |
+| Generalist surplus | -2.3379 | 0.6073 |
+| Pub revenue/round | 66.81 | 2.74 |
+| Avg drift | 0.5873 | 0.0038 |
+
+31/50 trials converged.
+
+### Cell D — Embeddings, With Fees
+
+Lambda sweep selected λ=500 as optimal by value efficiency:
+
+| λ | ValEff | BoundDiv | WinDiv | Surplus/rnd | PubRev/rnd |
+|---|--------|----------|--------|-------------|------------|
+| 500 | 0.7765 | 0.7274 | 0.7674 | -1.2464 | 65.52 |
+| 1000 | 0.7725 | 0.7225 | 0.7620 | -1.2034 | 65.10 |
+| 2500 | 0.7718 | 0.7210 | 0.7599 | -1.1893 | 65.21 |
+| 5000 | 0.7711 | 0.7193 | 0.7588 | -1.1851 | 65.06 |
+| 10000 | 0.7707 | 0.7206 | 0.7596 | -1.1731 | 65.03 |
+
+Cell D at λ=500:
+
+| Metric | Mean | Std |
+|---|---|---|
+| Value efficiency | 0.7765 | 0.0301 |
+| Boundary diversity | 0.7274 | 0.0655 |
+| Win diversity | 0.7674 | 0.0589 |
+| Avg surplus/round | -1.2464 | 0.2440 |
+| Specialist surplus | -0.3255 | 0.4867 |
+| Generalist surplus | -2.2989 | 0.6153 |
+| Pub revenue/round | 65.52 | 2.90 |
+| Avg drift | 0.1471 | 0.0070 |
+
+31/50 trials converged.
+
+## Comparison Table
+
+| Metric | Cell A (kw) | Cell C (emb) | Cell D (λ=500) | A↔C | C↔D |
+|---|---|---|---|---|---|
+| Value efficiency | 0.8376±0.0185 | 0.7716±0.0283 | 0.7765±0.0301 | *** | ns |
+| Boundary diversity | 0.8071±0.0322 | 0.7245±0.0542 | 0.7274±0.0655 | *** | ns |
+| Win diversity | 0.8118±0.0272 | 0.7615±0.0509 | 0.7674±0.0589 | *** | ns |
+| Avg surplus/round | -1.3950±0.1768 | -1.3057±0.2399 | -1.2464±0.2440 | * | ns |
+| Specialist surplus | -0.5437±0.5187 | -0.4025±0.4986 | -0.3255±0.4867 | ns | ns |
+| Generalist surplus | -2.3680±0.5945 | -2.3379±0.6073 | -2.2989±0.6153 | ns | ns |
+| Pub revenue/round | 73.05±1.87 | 66.81±2.74 | 65.52±2.90 | *** | * |
+| Avg drift | 0.0000±0.0000 | 0.5873±0.0038 | 0.1471±0.0070 | *** | *** |
+
+## Key Findings
+
+### 1. Tighter clusters make keyword bins stronger
+
+Value efficiency jumped from 0.747 (v3.2) to 0.838 (v3.3). When
+within-cluster cosine similarity is 0.80+, k-means bins capture the
+right competitors reliably, and price competition within the bin
+selects reasonable winners.
+
+### 2. Specialist surplus redistribution is no longer significant
+
+v3.2: specialist surplus -0.629 → -0.388, p<0.01
+v3.3: specialist surplus -0.544 → -0.403, ns
+
+v3.2: generalist surplus -1.806 → -2.760, p<0.001
+v3.3: generalist surplus -2.368 → -2.338, ns
+
+The direction is consistent (specialists gain, generalists lose) but
+the effect size shrinks dramatically with tighter clusters. The v3.2
+result was partly an artifact of loose clustering — descriptions were
+distinct enough for embeddings to separate easily, but distinct enough
+that k-means bins were coarser than necessary.
+
+### 3. Keywords still outperform on value efficiency
+
+0.838 (kw) vs 0.772 (emb), p<0.001. The hard bin filter eliminates
+cross-cluster noise more effectively than continuous scoring. This
+holds across all three versions (v3.1, v3.2, v3.3).
+
+### 4. Relocation fees still show no significant effect on surplus
+
+All C↔D surplus comparisons are ns. Fees reduce drift (0.59 → 0.15)
+but don't meaningfully change value efficiency or surplus distribution.
+
+### 5. Convergence degraded
+
+Only 31/50 embedding trials converged (vs 48/50 in v3.2). Tighter
+clusters create a harder optimization landscape — with less distance
+between competitors, the gradient signal for positioning is weaker.
+
+## Comparison: v3.2 vs v3.3
+
+| Metric | v3.2 A↔C | v3.3 A↔C |
+|---|---|---|
+| Value efficiency | *** | *** |
+| Specialist surplus | ** | ns |
+| Generalist surplus | *** | ns |
+| Pub revenue | *** | *** |
+
+The core claim (embedding surplus redistribution) is sensitive to
+cluster tightness. With distinct descriptions, the effect is strong.
+With realistic shared vocabulary, the effect exists directionally but
+is not statistically significant.
+
+## Interpretation
+
+The v3.2 finding that embeddings redistribute surplus was partly
+driven by the semantic gap between advertiser descriptions. When
+ClimbingPT was described as "physical therapy for rock climbers finger
+pulley A2 injury crimp rehab bouldering" and GeneralPT was "physical
+therapy rehabilitation pain management back pain recovery" (cos=0.78),
+embedding scoring could clearly separate them. When both share
+"licensed physical therapist providing rehabilitation exercise therapy
+injury recovery specializing in ..." (cos=0.82+), the separation
+signal weakens.
+
+This suggests the embedding advantage depends on how much niche
+information is in the advertiser's positioning signal. Real-world
+advertisers who differentiate on specific technical vocabulary
+(a climbing PT who says "A2 pulley crimp rehab") will benefit more
+from embedding auctions than those who position generically
+("physical therapy specializing in climbing"). The mechanism rewards
+specificity in positioning, not just in the underlying niche.
