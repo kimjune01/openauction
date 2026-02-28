@@ -3,7 +3,7 @@
 # requires-python = ">=3.10"
 # dependencies = ["fastembed"]
 # ///
-"""Generate real embeddings for the auction simulation.
+"""Generate real embeddings for the auction simulation (v3: near-miss niches).
 
 Uses BAAI/bge-small-en-v1.5 (384D, open-weight) via fastembed (ONNX runtime).
 Outputs embeddings.go with advertiser and query vectors as Go literals.
@@ -17,102 +17,111 @@ import numpy as np
 from fastembed import TextEmbedding
 
 # --- Advertisers ---
-# Each entry: (name, description for embedding, max_value, base_bid, base_sigma, base_budget, strategy)
-# Strategy: 0=Greedy, 1=Moderate, 2=Conservative
+# Each entry: (name, description for embedding, max_value, base_bid, base_sigma, base_budget)
+# Cluster assignment is implicit by position (0=PT, 1=Fitness, 2=Nutrition, 3=Tutoring)
 ADVERTISERS = [
-    ("Nike", "Nike running shoes marathon athletic footwear trail running sneakers", 12.0, 4.00, 0.55, 8000, 0),
-    ("Peloton", "Peloton home fitness spin bike connected workout cycling exercise", 10.0, 3.50, 0.50, 7000, 1),
-    ("Gymshark", "Gymshark gym apparel workout clothing fitness activewear tank tops", 8.0, 2.80, 0.50, 5000, 0),
-    ("Whoop", "Whoop fitness tracker recovery monitoring wearable health data band", 9.0, 3.00, 0.45, 6000, 2),
-    ("Lululemon", "Lululemon yoga pants athleisure activewear women leggings sports bra", 11.0, 3.80, 0.55, 7500, 1),
-    ("Zara", "Zara fast fashion trendy clothing seasonal outfits affordable style", 9.0, 3.20, 0.60, 6500, 0),
-    ("Everlane", "Everlane sustainable basics minimalist wardrobe ethical fashion capsule", 7.0, 2.50, 0.45, 4000, 2),
-    ("AthleticGreens", "Athletic Greens AG1 daily supplement greens superfood powder nutrition", 8.0, 3.00, 0.40, 5500, 1),
-    ("Headspace", "Headspace meditation app mindfulness stress relief sleep calm focus", 7.0, 2.20, 0.45, 4500, 2),
-    ("Noom", "Noom weight management healthy eating behavior change diet app coaching", 9.0, 3.20, 0.50, 6000, 1),
-    ("RogueFitness", "Rogue Fitness powerlifting equipment barbell squat rack bumper plates", 10.0, 3.50, 0.40, 5000, 0),
-    ("LaSportiva", "La Sportiva climbing shoes bouldering mountaineering rock climbing gear", 6.0, 1.80, 0.35, 3000, 2),
-    ("PrecisionNutrition", "Precision Nutrition sports dietetics coaching macro meal planning athletes", 7.0, 2.40, 0.40, 4000, 1),
-    ("AppleWatch", "Apple Watch smartwatch health fitness tracking heart rate ECG workout", 12.0, 4.50, 0.60, 9000, 1),
-    ("Dyson", "Dyson home appliances air purifier vacuum cleaner hair dryer technology", 8.0, 2.80, 0.35, 5000, 2),
+    # Physical Therapy cluster (5) — keyword: "physical therapy"
+    ("ClimbingPT", "physical therapy for rock climbers finger pulley A2 injury crimp rehab bouldering", 10.0, 3.5, 0.45, 6000),
+    ("SportsPT", "sports physical therapy ACL recovery athletic injury return to play", 10.0, 3.5, 0.45, 6000),
+    ("PelvicFloorPT", "pelvic floor physical therapy postpartum incontinence diastasis recti women's health", 9.0, 3.0, 0.45, 5500),
+    ("PediatricPT", "pediatric physical therapy child motor development cerebral palsy early intervention", 8.0, 2.8, 0.45, 5000),
+    ("GeneralPT", "physical therapy rehabilitation pain management back pain recovery", 8.0, 3.0, 0.50, 6000),
+
+    # Fitness Coaching cluster (4) — keyword: "fitness coach"
+    ("ClimbingCoach", "rock climbing coaching technique bouldering training movement skill beta", 9.0, 3.2, 0.45, 5500),
+    ("RunningCoach", "marathon running coach 5k training plan race pace interval speed", 9.0, 3.2, 0.45, 5500),
+    ("CrossFitCoach", "CrossFit coaching WOD functional fitness Olympic lifting competition prep", 9.0, 3.2, 0.45, 5500),
+    ("PersonalTrainer", "personal trainer fitness workout strength training exercise coaching", 8.0, 3.0, 0.50, 5500),
+
+    # Nutrition cluster (4) — keyword: "nutritionist"
+    ("SportsDietitian", "sports dietitian endurance athlete fueling race day nutrition carb loading", 9.0, 3.0, 0.45, 5500),
+    ("GutHealth", "gut health nutritionist SIBO IBS microbiome digestive wellness elimination diet", 8.0, 2.8, 0.45, 5000),
+    ("WeightLossCoach", "weight loss nutritionist calorie deficit macro counting portion control meal plan", 9.0, 3.0, 0.45, 5500),
+    ("GeneralNutritionist", "registered dietitian nutrition counseling healthy eating balanced diet meal planning", 7.0, 2.5, 0.50, 5000),
+
+    # Tutoring cluster (2) — keyword: "math tutor"
+    ("ADHDMathTutor", "math tutoring for ADHD students hands-on learning executive function support", 8.0, 2.8, 0.45, 4500),
+    ("GeneralMathTutor", "math tutoring algebra calculus SAT prep test preparation homework help", 7.0, 2.5, 0.50, 4500),
+]
+
+# Cluster boundaries: PT=0..4, Fitness=5..8, Nutrition=9..12, Tutoring=13..14
+CLUSTER_BOUNDARIES = [
+    (0, 5),   # PT
+    (5, 9),   # Fitness
+    (9, 13),  # Nutrition
+    (13, 15), # Tutoring
 ]
 
 # --- Impression query clusters ---
 # Each cluster: (name, weight, list of queries)
 CLUSTERS = [
-    ("running", 0.18, [
-        "best running shoes for beginners",
-        "marathon training plan 16 weeks",
-        "how to improve 5k time",
-        "running shoes for flat feet recommendations",
-        "couch to half marathon training program",
-        "best cardio exercises for weight loss",
-        "treadmill vs outdoor running comparison",
-        "GPS running watch heart rate monitor",
-        "compression socks benefits for runners",
-        "interval training speed workout plan",
+    ("physical_therapy", 0.35, [
+        # Specialist (4)
+        "finger pulley injury from rock climbing crimping",
+        "A2 pulley rehab protocol for bouldering",
+        "pelvic floor exercises after C-section delivery",
+        "potty training regression toddler physical therapy",
+        # Boundary (4)
+        "shoulder injury from overhead sport",
+        "hip flexor tightness from running and climbing",
+        "core stability exercises postpartum return to sport",
+        "growing pains in active child athlete",
+        # General (4)
+        "physical therapy for lower back pain",
+        "how to find a good physical therapist near me",
+        "physical therapy vs chiropractor for pain",
+        "does physical therapy actually work",
     ]),
-    ("yoga", 0.14, [
-        "yoga for beginners at home routine",
-        "best yoga mat thick cushion non slip",
-        "morning stretching routine for flexibility",
-        "yoga pants high waist comfortable leggings",
-        "meditation and yoga retreat weekend",
-        "hip opener yoga sequence for runners",
-        "yoga blocks and props for beginners",
-        "prenatal yoga exercises safe poses",
-        "yoga teacher training certification online",
-        "restorative yoga for stress and anxiety",
+    ("fitness_coaching", 0.25, [
+        # Specialist (3)
+        "how to train finger strength for climbing V7",
+        "16 week marathon training plan sub 3 hours",
+        "CrossFit open workout strategy tips",
+        # Boundary (3)
+        "strength training for endurance athletes",
+        "grip strength training for athletes",
+        "HIIT vs steady state cardio for fat loss",
+        # General (4)
+        "how to get in shape as a beginner",
+        "best exercise routine for weight loss",
+        "finding a good fitness coach online",
+        "workout plan for busy professionals",
     ]),
-    ("fashion", 0.22, [
-        "summer outfit ideas women casual",
-        "men's casual wear trends this season",
-        "sustainable fashion brands affordable",
-        "what to wear to a summer wedding",
-        "capsule wardrobe essentials minimalist",
-        "designer bags on sale outlet",
-        "street style fashion inspiration lookbook",
-        "professional workwear office outfits",
-        "vintage clothing stores online thrift",
-        "athleisure everyday outfits comfortable style",
+    ("nutrition", 0.25, [
+        # Specialist (3)
+        "what to eat before a marathon race day",
+        "low FODMAP diet for IBS symptom relief",
+        "macro split for cutting weight lifting",
+        # Boundary (3)
+        "protein timing around workouts for muscle",
+        "bloating after high protein diet",
+        "meal prep for athletes on a budget",
+        # General (4)
+        "healthy eating tips for beginners",
+        "how to eat better without dieting",
+        "should I see a nutritionist or dietitian",
+        "balanced meal plan for the week",
     ]),
-    ("strength", 0.15, [
-        "home gym equipment essentials beginner",
-        "beginner weight lifting program full body",
-        "squat rack for small home gym",
-        "best protein powder for muscle building",
-        "deadlift form and technique guide",
-        "resistance bands workout full body routine",
-        "powerlifting competition preparation training",
-        "adjustable dumbbells set review comparison",
-        "muscle building meal plan high protein",
-        "pre workout supplements best ingredients",
-    ]),
-    ("nutrition", 0.17, [
-        "healthy meal prep ideas for the week",
-        "weight loss meal plan calorie deficit",
-        "macro counting for beginners guide",
-        "vegan protein sources complete amino acids",
-        "anti-inflammatory diet foods to eat",
-        "intermittent fasting guide for beginners",
-        "gut health supplements probiotics prebiotics",
-        "low carb recipes easy weeknight dinner",
-        "sports nutrition for endurance athletes fueling",
-        "daily vitamins and supplements what to take",
-    ]),
-    ("wellness", 0.14, [
-        "meditation app for anxiety and stress",
-        "stress management techniques for work",
-        "sleep hygiene tips for better rest",
-        "mindfulness exercises for daily practice",
-        "burnout recovery strategies self care",
-        "therapy vs counseling what is the difference",
-        "journaling prompts for mental health",
-        "breathing exercises for calm and focus",
-        "digital detox challenge one week plan",
-        "work life balance tips remote workers",
+    ("tutoring", 0.15, [
+        # Specialist (2)
+        "math tutor for child with ADHD attention issues",
+        "SAT math prep tutoring intensive course",
+        # Boundary (2)
+        "my kid struggles with math motivation focus",
+        "hands-on math activities for kids who hate worksheets",
+        # General (2)
+        "find a math tutor near me",
+        "online math tutoring for middle school",
     ]),
 ]
+
+# Query type metadata: specialist=0, boundary=1, general=2
+QUERY_TYPES = {
+    "physical_therapy": [0]*4 + [1]*4 + [2]*4,
+    "fitness_coaching": [0]*3 + [1]*3 + [2]*4,
+    "nutrition":        [0]*3 + [1]*3 + [2]*4,
+    "tutoring":         [0]*2 + [1]*2 + [2]*2,
+}
 
 
 def fmt_vec(vec, per_line=8):
@@ -135,10 +144,12 @@ def main():
 
     # Embed all queries
     all_queries = []
+    all_types = []
     cluster_starts = []  # (cluster_idx, start, end)
     for ci, (name, weight, queries) in enumerate(CLUSTERS):
         start = len(all_queries)
         all_queries.extend(queries)
+        all_types.extend(QUERY_TYPES[name])
         cluster_starts.append((ci, start, len(all_queries)))
 
     print(f"Embedding {len(all_queries)} impression queries...")
@@ -148,13 +159,14 @@ def main():
     print(f"Embedding dimension: {dim}")
 
     # Compute some distance stats for calibration
-    print("\n--- Distance stats (squared Euclidean, normalized embeddings) ---")
-    for i, (name, *_) in enumerate(ADVERTISERS[:5]):
-        for j, (name2, *_) in enumerate(ADVERTISERS[:5]):
-            if i < j:
+    print("\n--- Intra-cluster distance stats (squared Euclidean, normalized embeddings) ---")
+    for ci, (cstart, cend) in enumerate(CLUSTER_BOUNDARIES):
+        cluster_name = ["PT", "Fitness", "Nutrition", "Tutoring"][ci]
+        for i in range(cstart, cend):
+            for j in range(i+1, cend):
                 d2 = np.sum((adv_embeddings[i] - adv_embeddings[j])**2)
                 cos = np.dot(adv_embeddings[i], adv_embeddings[j])
-                print(f"  {name} <-> {name2}: dist²={d2:.4f}  cos={cos:.4f}")
+                print(f"  [{cluster_name}] {ADVERTISERS[i][0]} <-> {ADVERTISERS[j][0]}: dist²={d2:.4f}  cos={cos:.4f}")
 
     # Write Go file
     out_path = "cmd/simulate/embeddings.go"
@@ -164,41 +176,57 @@ def main():
         f.write("// Code generated by gen_embeddings.py using BAAI/bge-small-en-v1.5 (384D). DO NOT EDIT.\n\n")
         f.write(f"const embeddingDim = {dim}\n\n")
 
+        # Query type enum
+        f.write("// Query type classification\n")
+        f.write("const (\n")
+        f.write("\tQuerySpecialist = 0\n")
+        f.write("\tQueryBoundary   = 1\n")
+        f.write("\tQueryGeneral    = 2\n")
+        f.write(")\n\n")
+
         # Advertiser data struct
         f.write("type advData struct {\n")
-        f.write("\tName      string\n")
-        f.write("\tEmbedding []float64\n")
-        f.write("\tMaxValue  float64\n")
-        f.write("\tBaseBid   float64\n")
-        f.write("\tBaseSigma float64\n")
+        f.write("\tName       string\n")
+        f.write("\tEmbedding  []float64\n")
+        f.write("\tMaxValue   float64\n")
+        f.write("\tBaseBid    float64\n")
+        f.write("\tBaseSigma  float64\n")
         f.write("\tBaseBudget float64\n")
-        f.write("\tStrategy  Strategy\n")
+        f.write("\tCluster    int\n")
         f.write("}\n\n")
 
         # Advertiser embeddings
         f.write("var advertiserData = []advData{\n")
-        for i, (name, desc, maxval, bid, sigma, budget, strat) in enumerate(ADVERTISERS):
-            strat_name = ["Greedy", "Moderate", "Conservative"][strat]
+        for i, (name, desc, maxval, bid, sigma, budget) in enumerate(ADVERTISERS):
+            # Determine cluster
+            cluster = 0
+            for ci, (cstart, cend) in enumerate(CLUSTER_BOUNDARIES):
+                if cstart <= i < cend:
+                    cluster = ci
+                    break
             f.write(f'\t{{ // {name}: "{desc[:60]}..."\n')
-            f.write(f'\t\tName: "{name}", MaxValue: {maxval}, BaseBid: {bid}, BaseSigma: {sigma}, BaseBudget: {budget}, Strategy: {strat_name},\n')
+            f.write(f'\t\tName: "{name}", MaxValue: {maxval}, BaseBid: {bid}, BaseSigma: {sigma}, BaseBudget: {budget}, Cluster: {cluster},\n')
             f.write(f"\t\tEmbedding: []float64{{\n")
             f.write(fmt_vec(adv_embeddings[i]))
             f.write("\n\t\t},\n")
             f.write("\t},\n")
         f.write("}\n\n")
 
-        # Query cluster struct
+        # Query cluster struct (with Types)
         f.write("type queryCluster struct {\n")
         f.write("\tName    string\n")
         f.write("\tWeight  float64\n")
         f.write("\tQueries [][]float64\n")
+        f.write("\tTypes   []int\n")
         f.write("}\n\n")
 
         # Query clusters
         f.write("var impressionClusters = []queryCluster{\n")
         for ci, (name, weight, queries) in enumerate(CLUSTERS):
             _, start, end = cluster_starts[ci]
-            f.write(f'\t{{Name: "{name}", Weight: {weight}, Queries: [][]float64{{\n')
+            types_slice = all_types[start:end]
+            types_str = ", ".join(str(t) for t in types_slice)
+            f.write(f'\t{{Name: "{name}", Weight: {weight}, Types: []int{{{types_str}}}, Queries: [][]float64{{\n')
             for qi in range(start, end):
                 query_text = all_queries[qi]
                 f.write(f'\t\t{{ // "{query_text}"\n')
