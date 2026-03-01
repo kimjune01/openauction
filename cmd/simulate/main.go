@@ -513,9 +513,9 @@ type HotellingTrialResult struct {
 }
 
 const (
-	maxRounds           = 200
-	evalWindow          = 20
-	impressionsPerRound = 50
+	maxRounds           = 300
+	evalWindow          = 30
+	impressionsPerRound = 80
 	convergenceEpsilon  = 0.01
 	convergenceWindow   = 5
 )
