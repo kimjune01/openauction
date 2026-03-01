@@ -1,0 +1,281 @@
+
+Experiment 0: Distance Validation
+=================================
+
+  Cluster assignments:
+    Cluster 0 (tight): KneePT, ShoulderPT, BackPT, HipPT, NeckPT
+    Cluster 1 (medium): ClimbingCoach, MarathonCoach, CrossFitCoach, YogaCoach, PersonalTrainer
+    Cluster 2 (loose): SportsDietitian, CBTTherapist, MassageTherapist, Acupuncturist, HealthCoach
+    Cluster 3 (very_tight): YogaStudioA, YogaStudioB, YogaStudioC, YogaStudioD, YogaStudioE
+    Cluster 4 (very_loose): AutoMechanic, RealEstateAgent, WeddingPhotographer, Plumber, Electrician
+
+  Intra-cluster cosine similarities:
+    [c0 tight] KneePT          ↔ ShoulderPT       cos=0.8770
+    [c0 tight] KneePT          ↔ BackPT           cos=0.9002
+    [c0 tight] KneePT          ↔ HipPT            cos=0.8946
+    [c0 tight] KneePT          ↔ NeckPT           cos=0.8591
+    [c0 tight] ShoulderPT      ↔ BackPT           cos=0.8977
+    [c0 tight] ShoulderPT      ↔ HipPT            cos=0.8867
+    [c0 tight] ShoulderPT      ↔ NeckPT           cos=0.9005
+    [c0 tight] BackPT          ↔ HipPT            cos=0.9205
+    [c0 tight] BackPT          ↔ NeckPT           cos=0.9148
+    [c0 tight] HipPT           ↔ NeckPT           cos=0.8997
+    → Cluster 0 (tight) mean=0.8951  min=0.8591  max=0.9205
+
+    [c1 medium] ClimbingCoach   ↔ MarathonCoach    cos=0.8064
+    [c1 medium] ClimbingCoach   ↔ CrossFitCoach    cos=0.8065
+    [c1 medium] ClimbingCoach   ↔ YogaCoach        cos=0.8096
+    [c1 medium] ClimbingCoach   ↔ PersonalTrainer  cos=0.8309
+    [c1 medium] MarathonCoach   ↔ CrossFitCoach    cos=0.8430
+    [c1 medium] MarathonCoach   ↔ YogaCoach        cos=0.8064
+    [c1 medium] MarathonCoach   ↔ PersonalTrainer  cos=0.8485
+    [c1 medium] CrossFitCoach   ↔ YogaCoach        cos=0.8264
+    [c1 medium] CrossFitCoach   ↔ PersonalTrainer  cos=0.8722
+    [c1 medium] YogaCoach       ↔ PersonalTrainer  cos=0.8489
+    → Cluster 1 (medium) mean=0.8299  min=0.8064  max=0.8722
+
+    [c2 loose] SportsDietitian ↔ CBTTherapist     cos=0.5364
+    [c2 loose] SportsDietitian ↔ MassageTherapist  cos=0.6440
+    [c2 loose] SportsDietitian ↔ Acupuncturist    cos=0.5190
+    [c2 loose] SportsDietitian ↔ HealthCoach      cos=0.6468
+    [c2 loose] CBTTherapist    ↔ MassageTherapist  cos=0.6298
+    [c2 loose] CBTTherapist    ↔ Acupuncturist    cos=0.5999
+    [c2 loose] CBTTherapist    ↔ HealthCoach      cos=0.6978
+    [c2 loose] MassageTherapist ↔ Acupuncturist    cos=0.6263
+    [c2 loose] MassageTherapist ↔ HealthCoach      cos=0.6462
+    [c2 loose] Acupuncturist   ↔ HealthCoach      cos=0.6097
+    → Cluster 2 (loose) mean=0.6156  min=0.5190  max=0.6978
+
+    [c3 very_tight] YogaStudioA     ↔ YogaStudioB      cos=0.9750
+    [c3 very_tight] YogaStudioA     ↔ YogaStudioC      cos=0.9788
+    [c3 very_tight] YogaStudioA     ↔ YogaStudioD      cos=0.9756
+    [c3 very_tight] YogaStudioA     ↔ YogaStudioE      cos=0.9768
+    [c3 very_tight] YogaStudioB     ↔ YogaStudioC      cos=0.9748
+    [c3 very_tight] YogaStudioB     ↔ YogaStudioD      cos=0.9706
+    [c3 very_tight] YogaStudioB     ↔ YogaStudioE      cos=0.9658
+    [c3 very_tight] YogaStudioC     ↔ YogaStudioD      cos=0.9721
+    [c3 very_tight] YogaStudioC     ↔ YogaStudioE      cos=0.9669
+    [c3 very_tight] YogaStudioD     ↔ YogaStudioE      cos=0.9851
+    → Cluster 3 (very_tight) mean=0.9742  min=0.9658  max=0.9851
+
+    [c4 very_loose] AutoMechanic    ↔ RealEstateAgent  cos=0.5087
+    [c4 very_loose] AutoMechanic    ↔ WeddingPhotographer  cos=0.4131
+    [c4 very_loose] AutoMechanic    ↔ Plumber          cos=0.6599
+    [c4 very_loose] AutoMechanic    ↔ Electrician      cos=0.5958
+    [c4 very_loose] RealEstateAgent ↔ WeddingPhotographer  cos=0.4518
+    [c4 very_loose] RealEstateAgent ↔ Plumber          cos=0.5347
+    [c4 very_loose] RealEstateAgent ↔ Electrician      cos=0.5460
+    [c4 very_loose] WeddingPhotographer ↔ Plumber          cos=0.4450
+    [c4 very_loose] WeddingPhotographer ↔ Electrician      cos=0.4252
+    [c4 very_loose] Plumber         ↔ Electrician      cos=0.6911
+    → Cluster 4 (very_loose) mean=0.5271  min=0.4131  max=0.6911
+
+  Cross-cluster nearest pairs:
+    c0↔c1: BackPT          ↔ PersonalTrainer  cos=0.6715
+    c0↔c2: BackPT          ↔ MassageTherapist  cos=0.8079
+    c0↔c3: BackPT          ↔ YogaStudioE      cos=0.5885
+    c0↔c4: HipPT           ↔ AutoMechanic     cos=0.5450
+    c1↔c2: YogaCoach       ↔ HealthCoach      cos=0.7718
+    c1↔c3: YogaCoach       ↔ YogaStudioE      cos=0.7663
+    c1↔c4: YogaCoach       ↔ WeddingPhotographer  cos=0.5454
+    c2↔c3: HealthCoach     ↔ YogaStudioC      cos=0.6249
+    c2↔c4: HealthCoach     ↔ WeddingPhotographer  cos=0.5741
+    c3↔c4: YogaStudioD     ↔ WeddingPhotographer  cos=0.5519
+
+  Each advertiser's closest query:
+  Advertiser            cos       Query
+  -----------------------------------------------------------------
+  KneePT                0.9203    knee injury physical therapy
+  ShoulderPT            0.9142    shoulder injury physical
+  BackPT                0.8397    physical therapy injury
+  HipPT                 0.9202    hip injury rehabilitation
+  NeckPT                0.8285    hip injury rehabilitation
+  ClimbingCoach         0.8096    rock climbing training plan
+  MarathonCoach         0.8311    marathon training program race
+  CrossFitCoach         0.8573    CrossFit workout functional
+  YogaCoach             0.7954    yoga flexibility mindfulness
+  PersonalTrainer       0.7371    CrossFit workout functional
+  SportsDietitian       0.8205    sports nutrition meal plan
+  CBTTherapist          0.8152    cognitive behavioral therapy
+  MassageTherapist      0.9356    deep tissue massage sports
+  Acupuncturist         0.8765    acupuncture chronic pain
+  HealthCoach           0.7660    mental health wellness
+  YogaStudioA           0.8607    certified yoga teacher private
+  YogaStudioB           0.8582    certified yoga teacher private
+  YogaStudioC           0.8561    certified yoga teacher private
+  YogaStudioD           0.8621    certified yoga teacher private
+  YogaStudioE           0.8584    certified yoga teacher private
+  AutoMechanic          0.7948    car brake repair mechanic near
+  RealEstateAgent       0.9309    home buying real estate agent
+  WeddingPhotographer   0.8973    wedding photographer booking
+  Plumber               0.8080    plumber pipe leak repair
+  Electrician           0.9017    electrician wiring panel
+
+Experiment 1: Value Decay Calibration
+=====================================
+
+  5 closest advertiser-query pairs:
+    dist²=0.1287 cos=0.936  MassageTherapist     ↔ deep tissue massage sports
+    dist²=0.1381 cos=0.931  RealEstateAgent      ↔ home buying real estate agent
+    dist²=0.1595 cos=0.920  KneePT               ↔ knee injury physical therapy
+    dist²=0.1595 cos=0.920  HipPT                ↔ hip injury rehabilitation
+    dist²=0.1715 cos=0.914  ShoulderPT           ↔ shoulder injury physical
+
+  5 farthest advertiser-query pairs:
+    dist²=1.2623 cos=0.369  YogaStudioB          ↔ plumber pipe leak repair
+    dist²=1.2632 cos=0.368  YogaStudioA          ↔ plumber pipe leak repair
+    dist²=1.2657 cos=0.367  YogaStudioE          ↔ plumber pipe leak repair
+    dist²=1.2834 cos=0.358  AutoMechanic         ↔ how to start practicing yoga
+    dist²=1.2871 cos=0.356  AutoMechanic         ↔ best workout plan for
+
+  Each advertiser's closest query:
+    dist²=0.1595 cos=0.920  KneePT               ↔ knee injury physical therapy
+    dist²=0.1715 cos=0.914  ShoulderPT           ↔ shoulder injury physical
+    dist²=0.3206 cos=0.840  BackPT               ↔ physical therapy injury
+    dist²=0.1595 cos=0.920  HipPT                ↔ hip injury rehabilitation
+    dist²=0.3429 cos=0.829  NeckPT               ↔ hip injury rehabilitation
+    dist²=0.3808 cos=0.810  ClimbingCoach        ↔ rock climbing training plan
+    dist²=0.3377 cos=0.831  MarathonCoach        ↔ marathon training program race
+    dist²=0.2854 cos=0.857  CrossFitCoach        ↔ CrossFit workout functional
+    dist²=0.4091 cos=0.795  YogaCoach            ↔ yoga flexibility mindfulness
+    dist²=0.5258 cos=0.737  PersonalTrainer      ↔ CrossFit workout functional
+    dist²=0.3590 cos=0.820  SportsDietitian      ↔ sports nutrition meal plan
+    dist²=0.3697 cos=0.815  CBTTherapist         ↔ cognitive behavioral therapy
+    dist²=0.1287 cos=0.936  MassageTherapist     ↔ deep tissue massage sports
+    dist²=0.2471 cos=0.876  Acupuncturist        ↔ acupuncture chronic pain
+    dist²=0.4680 cos=0.766  HealthCoach          ↔ mental health wellness
+    dist²=0.2786 cos=0.861  YogaStudioA          ↔ certified yoga teacher private
+    dist²=0.2835 cos=0.858  YogaStudioB          ↔ certified yoga teacher private
+    dist²=0.2878 cos=0.856  YogaStudioC          ↔ certified yoga teacher private
+    dist²=0.2758 cos=0.862  YogaStudioD          ↔ certified yoga teacher private
+    dist²=0.2831 cos=0.858  YogaStudioE          ↔ certified yoga teacher private
+    dist²=0.4104 cos=0.795  AutoMechanic         ↔ car brake repair mechanic near
+    dist²=0.1381 cos=0.931  RealEstateAgent      ↔ home buying real estate agent
+    dist²=0.2055 cos=0.897  WeddingPhotographer  ↔ wedding photographer booking
+    dist²=0.3839 cos=0.808  Plumber              ↔ plumber pipe leak repair
+    dist²=0.1966 cos=0.902  Electrician          ↔ electrician wiring panel
+
+  Value % at different decays:
+  Advertiser             Query                           dist²   d=0.2   d=0.3   d=0.4   d=0.5
+  --------------------------------------------------------------------------------------------------------------
+  MassageTherapist       deep tissue massage sports      0.1287  52.5    65.1    72.5    77.3
+  MassageTherapist       deep tissue massage sports      0.1287  52.5    65.1    72.5    77.3
+  YogaStudioC            finding a good fitness coach    0.8970  1.1     5.0     10.6    16.6
+  AutoMechanic           best workout plan for           1.2871  0.2     1.4     4.0     7.6
+
+  Chosen valueDecay = 0.30
+  Rationale: closest pair → 65%, farthest → 1.4% (ratio 48:1)
+
+  Query types (at decay=0.30): specialist=18, boundary=37, general=0
+
+Experiment 2: Hotelling Drift × Cluster Tightness
+==================================================
+
+  Cluster density (mean pairwise cosine):
+    Cluster 0 (tight): 0.8951
+    Cluster 1 (medium): 0.8299
+    Cluster 2 (loose): 0.6156
+    Cluster 3 (very_tight): 0.9742
+    Cluster 4 (very_loose): 0.5271
+
+  Lambda sweep (50 trials each, 300 rounds):
+  Lambda    ValEff        AvgDrift      Converged
+  --------------------------------------------------
+  500       0.6732        0.3935        41/50
+  1000      0.6756        0.2363        39/50
+  2500      0.6826        0.0882        41/50
+  5000      0.6830        0.0440        42/50
+  10000     0.6815        0.0213        41/50
+
+  Optimal λ = 5000 (value efficiency = 0.6830)
+
+  Running Cell A (keyword), Cell C (λ=0), Cell D (λ=5000), Cell E (adaptive λ), 50 trials each...
+
+  Adaptive λ schedule (optλ=5000, mean density=0.7684):
+    Cluster 0 (tight): λ=5825 (density=0.8951)
+    Cluster 1 (medium): λ=5400 (density=0.8299)
+    Cluster 2 (loose): λ=4006 (density=0.6156)
+    Cluster 3 (very_tight): λ=6339 (density=0.9742)
+    Cluster 4 (very_loose): λ=3430 (density=0.5271)
+
+  ── Cluster 0 (tight, density=0.8951) ──
+    Metric                    Cell A      Cell C      Cell D      Cell E
+    --------------------------------------------------------------------
+    Surplus/round/adv         1.6924      4.5124      5.2889      5.2956
+    Drift magnitude           n/a         0.4827      0.0677      n/a
+    Centripetal fraction      n/a         0.5690      0.5634      n/a
+    Surplus A↔C: p=0.0000 ***  A↔D: p=0.0000 ***  D↔E: p=0.9770 ns
+    Drift C↔D: p=0.0000 ***  Centripetal C↔D: p=0.0008 ***
+
+  ── Cluster 1 (medium, density=0.8299) ──
+    Metric                    Cell A      Cell C      Cell D      Cell E
+    --------------------------------------------------------------------
+    Surplus/round/adv         0.7583      0.1561      0.3346      0.3393
+    Drift magnitude           n/a         0.5844      0.0445      n/a
+    Centripetal fraction      n/a         0.5477      0.5341      n/a
+    Surplus A↔C: p=0.0000 ***  A↔D: p=0.0000 ***  D↔E: p=0.9408 ns
+    Drift C↔D: p=0.0000 ***  Centripetal C↔D: p=0.0000 ***
+
+  ── Cluster 2 (loose, density=0.6156) ──
+    Metric                    Cell A      Cell C      Cell D      Cell E
+    --------------------------------------------------------------------
+    Surplus/round/adv         1.9300      0.2407      0.4434      0.4589
+    Drift magnitude           n/a         0.5823      0.0420      n/a
+    Centripetal fraction      n/a         0.8023      0.7852      n/a
+    Surplus A↔C: p=0.0000 ***  A↔D: p=0.0000 ***  D↔E: p=0.9346 ns
+    Drift C↔D: p=0.0000 ***  Centripetal C↔D: p=0.0000 ***
+
+  ── Cluster 3 (very_tight, density=0.9742) ──
+    Metric                    Cell A      Cell C      Cell D      Cell E
+    --------------------------------------------------------------------
+    Surplus/round/adv         1.4645      1.6788      1.6480      1.6456
+    Drift magnitude           n/a         0.5103      0.0526      n/a
+    Centripetal fraction      n/a         0.2825      0.2846      n/a
+    Surplus A↔C: p=0.1835 ns  A↔D: p=0.2269 ns  D↔E: p=0.9907 ns
+    Drift C↔D: p=0.0000 ***  Centripetal C↔D: p=0.0582 ns
+
+  ── Cluster 4 (very_loose, density=0.5271) ──
+    Metric                    Cell A      Cell C      Cell D      Cell E
+    --------------------------------------------------------------------
+    Surplus/round/adv         1.6602      4.1851      4.3626      4.3492
+    Drift magnitude           n/a         0.5125      0.0133      n/a
+    Centripetal fraction      n/a         0.7348      0.5098      n/a
+    Surplus A↔C: p=0.0000 ***  A↔D: p=0.0000 ***  D↔E: p=0.8220 ns
+    Drift C↔D: p=0.0000 ***  Centripetal C↔D: p=0.0000 ***
+
+  ── Aggregate Comparison ──
+    Metric                    Cell A      Cell C      Cell D      Cell E
+    --------------------------------------------------------------------
+    Value efficiency          0.7469      0.6689      0.6830      0.6813
+    Avg surplus/round/adv     1.5011      2.1546      2.4155      2.4177
+    Surplus: A↔C p=0.0000 ***  A↔D p=0.0000 ***  C↔D p=0.0000 ***  D↔E p=0.9712 ns
+
+  ── Tightness × Fee Effect Correlation (n=5) ──
+    Cluster       Density     ΔSurplus(D-C)   ΔDrift(C-D)     ΔCentripetal
+    ----------------------------------------------------------------------
+    tight         0.8951      0.7765          0.4150          -0.0056
+    medium        0.8299      0.1785          0.5399          -0.0136
+    loose         0.6156      0.2027          0.5402          -0.0170
+    very_tight    0.9742      -0.0307         0.4577          0.0021
+    very_loose    0.5271      0.1775          0.4992          -0.2250
+
+    Pearson r (density × ΔSurplus):      0.1272  (n=5)
+    Pearson r (density × ΔDrift):        -0.5586  (n=5)
+    Pearson r (density × ΔCentripetal):  0.7577  (n=5)
+
+  ── Cell D (uniform λ) vs Cell E (adaptive λ) ──
+    Cluster 0 (tight): D=5.2889  E=5.2956  Δ=0.0067  p=0.9770 ns
+    Cluster 1 (medium): D=0.3346  E=0.3393  Δ=0.0047  p=0.9408 ns
+    Cluster 2 (loose): D=0.4434  E=0.4589  Δ=0.0155  p=0.9346 ns
+    Cluster 3 (very_tight): D=1.6480  E=1.6456  Δ=-0.0024  p=0.9907 ns
+    Cluster 4 (very_loose): D=4.3626  E=4.3492  Δ=-0.0133  p=0.8220 ns
+
+  ── Key Findings ──
+    [+] Cluster 0 (tight): centripetal fraction = 0.5690 (positive → Hotelling drift)
+    [+] Cluster 1 (medium): centripetal fraction = 0.5477 (positive → Hotelling drift)
+    [+] Cluster 2 (loose): centripetal fraction = 0.8023 (positive → Hotelling drift)
+    [+] Cluster 3 (very_tight): centripetal fraction = 0.2825 (positive → Hotelling drift)
+    [+] Cluster 4 (very_loose): centripetal fraction = 0.7348 (positive → Hotelling drift)
+    → Hotelling drift detected in all clusters under free positioning (Cell C)
+    → No strong correlation between tightness and fee effect (r=0.13, n=5)
+    → Adaptive λ not significantly different from uniform (p=0.9712)
