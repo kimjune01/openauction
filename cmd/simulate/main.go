@@ -48,6 +48,22 @@ func cosineSim(a, b []float64) float64 {
 	return dot / (na * nb)
 }
 
+func vecSub(a, b []float64) []float64 {
+	r := make([]float64, len(a))
+	for i := range a {
+		r[i] = a[i] - b[i]
+	}
+	return r
+}
+
+func vecDot(a, b []float64) float64 {
+	sum := 0.0
+	for i := range a {
+		sum += a[i] * b[i]
+	}
+	return sum
+}
+
 // --- Advertiser ---
 
 type queryResult struct {
@@ -60,6 +76,7 @@ type queryResult struct {
 type Advertiser struct {
 	Name            string
 	Cluster         int
+	IsSpecialist    bool
 	IdealCenter     []float64
 	CommittedCenter []float64
 	Center          []float64
@@ -188,13 +205,15 @@ func (a *Advertiser) Adapt(lambda float64) {
 	a.Price = math.Max(a.Price, 0.01)
 }
 
-// AdaptKeyword does price-only adaptation for the keyword cell.
+// AdaptKeyword uses price-only adaptation (no positioning or sigma changes).
 func (a *Advertiser) AdaptKeyword() {
 	const lr = 0.02
+
 	if len(a.RoundQueries) == 0 {
 		return
 	}
 	nq := float64(len(a.RoundQueries))
+
 	targetPrice := 0.0
 	for _, qr := range a.RoundQueries {
 		targetPrice += qr.Value
@@ -202,133 +221,6 @@ func (a *Advertiser) AdaptKeyword() {
 	targetPrice /= nq
 	a.Price += lr * (targetPrice - a.Price)
 	a.Price = math.Max(a.Price, 0.01)
-}
-
-// --- Keyword Bins ---
-
-// globalKeywordBins maps [clusterIdx][queryIdx] -> advertiser cluster index (nearest centroid).
-var globalKeywordBins [][]int
-
-// computeKeywordBins assigns each query to its nearest advertiser k-means cluster centroid.
-func computeKeywordBins() {
-	// Compute advertiser cluster centroids
-	clusterEmbeddings := make(map[int][][]float64)
-	for _, ad := range advertiserData {
-		clusterEmbeddings[ad.Cluster] = append(clusterEmbeddings[ad.Cluster], ad.Embedding)
-	}
-	centroids := make(map[int][]float64)
-	for c, embs := range clusterEmbeddings {
-		centroids[c] = centroid(embs)
-	}
-
-	globalKeywordBins = make([][]int, len(impressionClusters))
-	for ci, ic := range impressionClusters {
-		globalKeywordBins[ci] = make([]int, len(ic.Queries))
-		for qi, q := range ic.Queries {
-			bestCluster := 0
-			bestDist := math.Inf(1)
-			for c, cen := range centroids {
-				d := squaredDist(q, cen)
-				if d < bestDist {
-					bestDist = d
-					bestCluster = c
-				}
-			}
-			globalKeywordBins[ci][qi] = bestCluster
-		}
-	}
-}
-
-// runKeywordAuctionRound runs a keyword-bin auction: queries mapped to discrete bins,
-// only matching-cluster advertisers compete, pure price ranking, second-price payment.
-func runKeywordAuctionRound(advs []*Advertiser, queries []SampledQuery) (float64, []perQueryResult) {
-	revenue := 0.0
-	var pqResults []perQueryResult
-
-	for _, sq := range queries {
-		q := sq.Embedding
-
-		// Look up keyword bin
-		kwBin := globalKeywordBins[sq.ClusterIdx][sq.QueryIdx]
-
-		// Filter to advertisers in matching cluster
-		var bids []core.CoreBid
-		bidderMap := make(map[string]*Advertiser)
-		for _, adv := range advs {
-			if adv.Cluster == kwBin && adv.Budget > adv.Price && adv.ShouldBid(q) {
-				bids = append(bids, adv.MakeBid())
-				bidderMap[adv.Name] = adv
-			}
-		}
-		if len(bids) == 0 {
-			continue
-		}
-
-		// Pure price auction — no queryEmbedding → RankCoreBids (price ranking)
-		result := core.RunAuction(bids, nil, 0)
-		if result.Winner == nil {
-			continue
-		}
-		winner := bidderMap[result.Winner.Bidder]
-		if winner == nil {
-			continue
-		}
-
-		value := winner.ValueAt(q)
-
-		// maxVal across ALL advertisers (not just bin participants) — measures keyword tax
-		maxVal := 0.0
-		for _, adv := range advs {
-			v := adv.ValueAt(q)
-			if v > maxVal {
-				maxVal = v
-			}
-		}
-
-		// Second-price payment
-		var payment float64
-		if result.RunnerUp != nil {
-			payment = result.RunnerUp.Price
-		} else {
-			payment = winner.Price
-		}
-
-		winner.RoundWins++
-		winner.RoundSpend += payment
-		winner.RoundValueWon += value
-		winner.TotalWins++
-		winner.TotalSpend += payment
-		winner.TotalValueWon += value
-		winner.Budget -= payment
-		revenue += payment
-
-		qType := QueryGeneral
-		if globalQueryTypes != nil && sq.ClusterIdx < len(globalQueryTypes) && sq.QueryIdx < len(globalQueryTypes[sq.ClusterIdx]) {
-			qType = globalQueryTypes[sq.ClusterIdx][sq.QueryIdx]
-		}
-
-		pqResults = append(pqResults, perQueryResult{
-			WinnerValue: value,
-			MaxValue:    maxVal,
-			WinnerName:  winner.Name,
-			QueryType:   qType,
-		})
-
-		// Record query result for winner
-		winner.RoundQueries = append(winner.RoundQueries, queryResult{
-			Query: q, Value: value, Won: true, Payment: payment,
-		})
-
-		// Record for other bidders
-		for name, adv := range bidderMap {
-			if name != winner.Name {
-				adv.RoundQueries = append(adv.RoundQueries, queryResult{
-					Query: q, Value: adv.ValueAt(q), Won: false, Payment: 0,
-				})
-			}
-		}
-	}
-	return revenue, pqResults
 }
 
 // --- Publisher ---
@@ -380,20 +272,16 @@ type perQueryResult struct {
 
 // --- Runtime query type classification ---
 
-// computeQueryTypes classifies each query as specialist/boundary/general
-// based on the actual advertiser value landscape.
 func computeQueryTypes(valueDecay float64) [][]int {
 	types := make([][]int, len(impressionClusters))
 	for ci, c := range impressionClusters {
 		types[ci] = make([]int, len(c.Queries))
 		for qi, q := range c.Queries {
-			// Compute value for each advertiser
 			vals := make([]float64, len(advertiserData))
 			for ai, ad := range advertiserData {
 				dist2 := squaredDist(ad.Embedding, q)
 				vals[ai] = ad.MaxValue * math.Exp(-dist2/valueDecay)
 			}
-			// Sort descending
 			sorted := make([]float64, len(vals))
 			copy(sorted, vals)
 			sort.Sort(sort.Reverse(sort.Float64Slice(sorted)))
@@ -413,53 +301,7 @@ func computeQueryTypes(valueDecay float64) [][]int {
 	return types
 }
 
-// Global query types, set once in main after calibration.
 var globalQueryTypes [][]int
-
-// --- Specialist/Generalist Classification ---
-
-// globalSpecialists maps advertiser name -> true if specialist.
-var globalSpecialists map[string]bool
-
-// classifyAdvertisers labels each advertiser as specialist or generalist.
-// For each advertiser, count queries where they have >50% of the max possible value.
-// The median niche count splits: below-median = specialist, above-median = generalist.
-func classifyAdvertisers(valueDecay float64) {
-	globalSpecialists = make(map[string]bool)
-
-	nicheCounts := make(map[string]int)
-	for _, ad := range advertiserData {
-		count := 0
-		for _, c := range impressionClusters {
-			for _, q := range c.Queries {
-				adVal := ad.MaxValue * math.Exp(-squaredDist(ad.Embedding, q)/valueDecay)
-				maxVal := 0.0
-				for _, other := range advertiserData {
-					v := other.MaxValue * math.Exp(-squaredDist(other.Embedding, q)/valueDecay)
-					if v > maxVal {
-						maxVal = v
-					}
-				}
-				if maxVal > 0 && adVal > 0.5*maxVal {
-					count++
-				}
-			}
-		}
-		nicheCounts[ad.Name] = count
-	}
-
-	// Find median niche count
-	counts := make([]float64, 0, len(nicheCounts))
-	for _, c := range nicheCounts {
-		counts = append(counts, float64(c))
-	}
-	sort.Float64s(counts)
-	median := counts[len(counts)/2]
-
-	for _, ad := range advertiserData {
-		globalSpecialists[ad.Name] = float64(nicheCounts[ad.Name]) <= median
-	}
-}
 
 // --- VCG Auction Round ---
 
@@ -492,7 +334,6 @@ func runAuctionRound(advs []*Advertiser, queries []SampledQuery) (float64, []per
 
 		value := winner.ValueAt(q)
 
-		// Find max value across ALL advertisers (oracle optimal)
 		maxVal := 0.0
 		for _, adv := range advs {
 			v := adv.ValueAt(q)
@@ -501,7 +342,7 @@ func runAuctionRound(advs []*Advertiser, queries []SampledQuery) (float64, []per
 			}
 		}
 
-		// VCG settlement — same formula for all cells (no σ=0 special case)
+		// VCG settlement
 		var payment float64
 		if result.RunnerUp != nil {
 			ru := bidderMap[result.RunnerUp.Bidder]
@@ -518,7 +359,10 @@ func runAuctionRound(advs []*Advertiser, queries []SampledQuery) (float64, []per
 			payment = winner.Price
 		}
 
-		// Cap payment to prevent numerical explosion
+		// Individual rationality: never pay more than your value
+		if payment > value {
+			payment = value
+		}
 		if payment > winner.Price*10 {
 			payment = winner.Price * 10
 		}
@@ -532,7 +376,6 @@ func runAuctionRound(advs []*Advertiser, queries []SampledQuery) (float64, []per
 		winner.Budget -= payment
 		revenue += payment
 
-		// Determine query type from global cache
 		qType := QueryGeneral
 		if globalQueryTypes != nil && sq.ClusterIdx < len(globalQueryTypes) && sq.QueryIdx < len(globalQueryTypes[sq.ClusterIdx]) {
 			qType = globalQueryTypes[sq.ClusterIdx][sq.QueryIdx]
@@ -545,12 +388,10 @@ func runAuctionRound(advs []*Advertiser, queries []SampledQuery) (float64, []per
 			QueryType:   qType,
 		})
 
-		// Record query result for winner
 		winner.RoundQueries = append(winner.RoundQueries, queryResult{
 			Query: q, Value: value, Won: true, Payment: payment,
 		})
 
-		// Record for all other bidders who bid
 		for name, adv := range bidderMap {
 			if name != winner.Name {
 				adv.RoundQueries = append(adv.RoundQueries, queryResult{
@@ -563,27 +404,6 @@ func runAuctionRound(advs []*Advertiser, queries []SampledQuery) (float64, []per
 }
 
 // --- Metrics ---
-
-func winDiversityFromWins(winCounts map[string]int, nAdvs int) float64 {
-	total := 0
-	for _, c := range winCounts {
-		total += c
-	}
-	if total == 0 {
-		return 0
-	}
-	hhi := 0.0
-	for _, c := range winCounts {
-		share := float64(c) / float64(total)
-		hhi += share * share
-	}
-	n := float64(nAdvs)
-	minHHI := 1.0 / n
-	if hhi <= minHHI {
-		return 1.0
-	}
-	return (1.0 - hhi) / (1.0 - minHHI)
-}
 
 func centroid(pts [][]float64) []float64 {
 	if len(pts) == 0 {
@@ -640,56 +460,7 @@ func valueEfficiencyFromResults(pqResults []perQueryResult) float64 {
 	return sum / float64(len(pqResults))
 }
 
-// boundaryDiversityFromResults computes HHI on boundary query winners.
-func boundaryDiversityFromResults(pqResults []perQueryResult, nAdvs int) float64 {
-	winCounts := make(map[string]int)
-	total := 0
-	for _, pq := range pqResults {
-		if pq.QueryType == QueryBoundary {
-			winCounts[pq.WinnerName]++
-			total++
-		}
-	}
-	if total == 0 {
-		return 0
-	}
-	hhi := 0.0
-	for _, c := range winCounts {
-		share := float64(c) / float64(total)
-		hhi += share * share
-	}
-	n := float64(nAdvs)
-	minHHI := 1.0 / n
-	if hhi <= minHHI {
-		return 1.0
-	}
-	return (1.0 - hhi) / (1.0 - minHHI)
-}
-
-// intraClusterPosVariance computes weighted mean position variance within clusters.
-func intraClusterPosVariance(advs []*Advertiser) float64 {
-	clusterAdvs := make(map[int][]*Advertiser)
-	for _, a := range advs {
-		clusterAdvs[a.Cluster] = append(clusterAdvs[a.Cluster], a)
-	}
-	totalVar := 0.0
-	totalWeight := 0.0
-	for _, cas := range clusterAdvs {
-		if len(cas) < 2 {
-			continue
-		}
-		v := computePositionVariance(cas)
-		w := float64(len(cas))
-		totalVar += v * w
-		totalWeight += w
-	}
-	if totalWeight == 0 {
-		return 0
-	}
-	return totalVar / totalWeight
-}
-
-// --- Convergence detection (per-dimension, diagnostic only) ---
+// --- Convergence detection ---
 
 type advSnapshot struct {
 	Center []float64
@@ -707,7 +478,6 @@ func snapshotAdvs(advs []*Advertiser) []advSnapshot {
 
 func hasConverged(prev []advSnapshot, curr []*Advertiser, epsilon float64) bool {
 	for i := range curr {
-		// Per-dimension max center change (fair across different dimensionalities)
 		maxCenterDelta := 0.0
 		for d := range prev[i].Center {
 			delta := math.Abs(curr[i].Center[d] - prev[i].Center[d])
@@ -726,39 +496,38 @@ func hasConverged(prev []advSnapshot, curr []*Advertiser, epsilon float64) bool 
 	return true
 }
 
-// --- Trial / Experiment ---
+// --- Hotelling Trial ---
 
-type TrialResult struct {
-	AdvSurplus        float64 // per-round, per-advertiser
-	PubRevenue        float64 // per-round
-	FeeRevenue        float64
-	WinDiversity      float64 // eval window
-	ValueEfficiency   float64 // eval window
-	BoundaryDiversity float64 // eval window
-	PosVariance       float64 // snapshot at end
-	IntraClusterVar   float64 // snapshot at end
-	AvgDrift          float64 // snapshot at end
-	ConvergedAtRound  int     // 0 = did not converge (diagnostic only)
-	SpecialistSurplus float64 // avg surplus per specialist per round
-	GeneralistSurplus float64 // avg surplus per generalist per round
+// HotellingTrialResult captures per-cluster metrics from a single trial.
+type HotellingTrialResult struct {
+	// Per-cluster metrics (indexed by cluster)
+	CentripetalFraction []float64 // cos(drift_vector, direction_to_centroid)
+	ClusterDrift        []float64 // mean drift magnitude
+	ClusterPosVariance  []float64 // position variance within cluster
+	ClusterSurplus      []float64 // mean surplus per advertiser per round
+
+	// Aggregate
+	ValueEfficiency  float64
+	AvgDrift         float64
+	ConvergedAtRound int
 }
 
 const (
-	maxRounds           = 200 // fixed for all cells — no early stopping
-	evalWindow          = 20  // last 20 rounds for metrics
+	maxRounds           = 200
+	evalWindow          = 20
 	impressionsPerRound = 50
 	convergenceEpsilon  = 0.01
 	convergenceWindow   = 5
 )
 
-func runTrial(lambda float64, valueDecay float64, keywordMode bool, makeAdvs func(rng *rand.Rand, valueDecay float64) []*Advertiser, seed int64) TrialResult {
+func runHotellingTrial(lambdas []float64, valueDecay float64, seed int64) HotellingTrialResult {
+	nClusters := len(clusterTightnessLabels)
 	rng := rand.New(rand.NewSource(seed))
 	pub := NewPublisher(seed)
-	advs := makeAdvs(rng, valueDecay)
+	advs := makeAdvertisers(rng, valueDecay)
 
 	// Eval window accumulators
 	var evalPQResults []perQueryResult
-	evalWins := make(map[string]int)
 
 	// Convergence diagnostic
 	convergedAt := 0
@@ -772,33 +541,16 @@ func runTrial(lambda float64, valueDecay float64, keywordMode bool, makeAdvs fun
 		}
 
 		queries := pub.SampleImpressions(impressionsPerRound)
-
-		var pqResults []perQueryResult
-		if keywordMode {
-			_, pqResults = runKeywordAuctionRound(advs, queries)
-		} else {
-			_, pqResults = runAuctionRound(advs, queries)
-		}
+		_, pqResults := runAuctionRound(advs, queries)
 
 		for _, adv := range advs {
-			if keywordMode {
-				adv.AdaptKeyword()
-			} else {
-				adv.Adapt(lambda)
-			}
+			adv.Adapt(lambdas[adv.Cluster])
 		}
 
-		// Accumulate eval window data (last evalWindow rounds)
 		if round > maxRounds-evalWindow {
 			evalPQResults = append(evalPQResults, pqResults...)
-			for _, adv := range advs {
-				if adv.RoundWins > 0 {
-					evalWins[adv.Name] += adv.RoundWins
-				}
-			}
 		}
 
-		// Track convergence as diagnostic (does not stop the trial)
 		if convergedAt == 0 {
 			if hasConverged(prev, advs, convergenceEpsilon) {
 				stableCount++
@@ -811,58 +563,106 @@ func runTrial(lambda float64, valueDecay float64, keywordMode bool, makeAdvs fun
 		}
 	}
 
-	// Compute metrics
-	totalAdvSurplus := 0.0
-	totalFees := 0.0
-	specSurplus := 0.0
-	genSurplus := 0.0
-	nSpec := 0
-	nGen := 0
+	return computeClusterMetrics(advs, evalPQResults, convergedAt, nClusters)
+}
+
+// computeClusterMetrics extracts per-cluster and aggregate metrics from a completed trial.
+func computeClusterMetrics(advs []*Advertiser, evalPQResults []perQueryResult, convergedAt int, nClusters int) HotellingTrialResult {
+	var result HotellingTrialResult
+	result.CentripetalFraction = make([]float64, nClusters)
+	result.ClusterDrift = make([]float64, nClusters)
+	result.ClusterPosVariance = make([]float64, nClusters)
+	result.ClusterSurplus = make([]float64, nClusters)
+	result.ValueEfficiency = valueEfficiencyFromResults(evalPQResults)
+	result.AvgDrift = avgDrift(advs)
+	result.ConvergedAtRound = convergedAt
+
+	// Group advertisers by cluster
+	clusterAdvs := make([][]*Advertiser, nClusters)
 	for _, a := range advs {
-		surplus := a.Surplus()
-		totalAdvSurplus += surplus
-		totalFees += a.TotalFees
-		if globalSpecialists != nil {
-			if globalSpecialists[a.Name] {
-				specSurplus += surplus
-				nSpec++
-			} else {
-				genSurplus += surplus
-				nGen++
-			}
+		if a.Cluster >= 0 && a.Cluster < nClusters {
+			clusterAdvs[a.Cluster] = append(clusterAdvs[a.Cluster], a)
 		}
 	}
-	avgSurplusPerRound := totalAdvSurplus / float64(len(advs)) / float64(maxRounds)
 
-	specSurpPerRound := 0.0
-	if nSpec > 0 {
-		specSurpPerRound = specSurplus / float64(nSpec) / float64(maxRounds)
-	}
-	genSurpPerRound := 0.0
-	if nGen > 0 {
-		genSurpPerRound = genSurplus / float64(nGen) / float64(maxRounds)
+	for c := 0; c < nClusters; c++ {
+		cas := clusterAdvs[c]
+		if len(cas) == 0 {
+			continue
+		}
+
+		// Cluster centroid (of committed centers — the "home" position)
+		committedCenters := make([][]float64, len(cas))
+		for i, a := range cas {
+			committedCenters[i] = a.CommittedCenter
+		}
+		clusterCentroid := centroid(committedCenters)
+
+		// Centripetal fraction: for each advertiser, cos(drift_vector, direction_to_centroid)
+		cpSum := 0.0
+		cpCount := 0
+		driftSum := 0.0
+		surplusSum := 0.0
+
+		for _, a := range cas {
+			drift := a.Drift()
+			driftSum += drift
+			surplusSum += a.Surplus()
+
+			if drift < 1e-10 {
+				continue
+			}
+			// drift vector = current - committed
+			driftVec := vecSub(a.Center, a.CommittedCenter)
+			// direction to centroid = centroid - committed
+			toCentroid := vecSub(clusterCentroid, a.CommittedCenter)
+
+			driftNorm := vecNorm(driftVec)
+			centroidNorm := vecNorm(toCentroid)
+			if driftNorm > 1e-10 && centroidNorm > 1e-10 {
+				cpSum += vecDot(driftVec, toCentroid) / (driftNorm * centroidNorm)
+				cpCount++
+			}
+		}
+
+		if cpCount > 0 {
+			result.CentripetalFraction[c] = cpSum / float64(cpCount)
+		}
+		result.ClusterDrift[c] = driftSum / float64(len(cas))
+		result.ClusterPosVariance[c] = computePositionVariance(cas)
+		result.ClusterSurplus[c] = surplusSum / float64(len(cas)) / float64(maxRounds)
 	}
 
-	pubRevenue := 0.0
-	for _, a := range advs {
-		pubRevenue += a.TotalSpend
-	}
-	pubRevenuePerRound := pubRevenue / float64(maxRounds)
+	return result
+}
 
-	return TrialResult{
-		AdvSurplus:        avgSurplusPerRound,
-		PubRevenue:        pubRevenuePerRound,
-		FeeRevenue:        totalFees,
-		WinDiversity:      winDiversityFromWins(evalWins, len(advs)),
-		ValueEfficiency:   valueEfficiencyFromResults(evalPQResults),
-		BoundaryDiversity: boundaryDiversityFromResults(evalPQResults, len(advs)),
-		PosVariance:       computePositionVariance(advs),
-		IntraClusterVar:   intraClusterPosVariance(advs),
-		AvgDrift:          avgDrift(advs),
-		ConvergedAtRound:  convergedAt,
-		SpecialistSurplus: specSurpPerRound,
-		GeneralistSurplus: genSurpPerRound,
+// --- Cluster density ---
+
+// computeClusterDensity returns the mean pairwise cosine similarity within each cluster.
+func computeClusterDensity() []float64 {
+	nClusters := len(clusterTightnessLabels)
+	density := make([]float64, nClusters)
+	for c := 0; c < nClusters; c++ {
+		var embs [][]float64
+		for _, ad := range advertiserData {
+			if ad.Cluster == c {
+				embs = append(embs, ad.Embedding)
+			}
+		}
+		if len(embs) < 2 {
+			continue
+		}
+		sum := 0.0
+		count := 0
+		for i := 0; i < len(embs); i++ {
+			for j := i + 1; j < len(embs); j++ {
+				sum += cosineSim(embs[i], embs[j])
+				count++
+			}
+		}
+		density[c] = sum / float64(count)
 	}
+	return density
 }
 
 // --- Stat helpers ---
@@ -877,7 +677,6 @@ func clamp(v, lo, hi float64) float64 {
 	return v
 }
 
-// sampleMeanStd computes mean and sample standard deviation (N-1).
 func sampleMeanStd(vals []float64) (float64, float64) {
 	n := len(vals)
 	if n == 0 {
@@ -932,7 +731,6 @@ func welchT(a, b []float64) (t float64, p float64) {
 	}
 	t = (ma - mb) / se
 
-	// Welch-Satterthwaite degrees of freedom
 	v1 := sa * sa / na
 	v2 := sb * sb / nb
 	num := (v1 + v2) * (v1 + v2)
@@ -942,7 +740,6 @@ func welchT(a, b []float64) (t float64, p float64) {
 	}
 	df := num / den
 
-	// Two-tailed p-value: for df>30 t≈z, use normal CDF approximation
 	x := t * (1 - 1/(4*df)) / math.Sqrt(1+t*t/(2*df))
 	p = 2 * (1 - normalCDF(math.Abs(x)))
 	return t, p
@@ -965,7 +762,32 @@ func sigStars(p float64) string {
 	return "ns"
 }
 
-// --- Factories ---
+// pearsonR computes Pearson correlation coefficient.
+func pearsonR(x, y []float64) float64 {
+	n := len(x)
+	if n < 2 || n != len(y) {
+		return 0
+	}
+	mx, _ := sampleMeanStd(x)
+	my, _ := sampleMeanStd(y)
+	num := 0.0
+	dx2 := 0.0
+	dy2 := 0.0
+	for i := range x {
+		dx := x[i] - mx
+		dy := y[i] - my
+		num += dx * dy
+		dx2 += dx * dx
+		dy2 += dy * dy
+	}
+	den := math.Sqrt(dx2 * dy2)
+	if den == 0 {
+		return 0
+	}
+	return num / den
+}
+
+// --- Factory ---
 
 func makeAdvertisers(rng *rand.Rand, valueDecay float64) []*Advertiser {
 	advs := make([]*Advertiser, len(advertiserData))
@@ -979,17 +801,204 @@ func makeAdvertisers(rng *rand.Rand, valueDecay float64) []*Advertiser {
 		advs[i] = &Advertiser{
 			Name:            d.Name,
 			Cluster:         d.Cluster,
+			IsSpecialist:    d.IsSpecialist,
 			IdealCenter:     ideal,
 			CommittedCenter: vecCopy(center),
 			Center:          center,
 			Price:           jitter(rng, d.BaseBid, d.BaseBid*0.10),
 			Sigma:           clamp(jitter(rng, d.BaseSigma, 0.03), 0.10, 0.75),
-			Budget:          1e9, // effectively infinite — remove budget depletion confound
+			Budget:          1e9,
 			MaxValue:        jitter(rng, d.MaxValue, 1.0),
 			ValueDecay:      valueDecay,
 		}
 	}
 	return advs
+}
+
+// --- Keyword Auction (Cell A baseline) ---
+
+// keywordBins maps each query (by cluster index, query index) to the nearest advertiser's cluster.
+// This simulates keyword-based matching: each query goes to the cluster whose centroid is closest.
+var keywordBins [][]int // [clusterIdx][queryIdx] → advertiser cluster index
+
+func computeKeywordBins() {
+	nClusters := len(clusterTightnessLabels)
+	// Compute per-cluster centroid of advertiser embeddings
+	clusterCentroids := make([][]float64, nClusters)
+	for c := 0; c < nClusters; c++ {
+		var embs [][]float64
+		for _, ad := range advertiserData {
+			if ad.Cluster == c {
+				embs = append(embs, ad.Embedding)
+			}
+		}
+		clusterCentroids[c] = centroid(embs)
+	}
+
+	keywordBins = make([][]int, len(impressionClusters))
+	for ci, ic := range impressionClusters {
+		keywordBins[ci] = make([]int, len(ic.Queries))
+		for qi, q := range ic.Queries {
+			bestCluster := 0
+			bestCos := -1.0
+			for c := 0; c < nClusters; c++ {
+				if clusterCentroids[c] == nil {
+					continue
+				}
+				cos := cosineSim(q, clusterCentroids[c])
+				if cos > bestCos {
+					bestCos = cos
+					bestCluster = c
+				}
+			}
+			keywordBins[ci][qi] = bestCluster
+		}
+	}
+}
+
+// runKeywordAuctionRound runs a keyword-based (cluster-filtered) second-price auction.
+func runKeywordAuctionRound(advs []*Advertiser, queries []SampledQuery) (float64, []perQueryResult) {
+	revenue := 0.0
+	var pqResults []perQueryResult
+
+	for _, sq := range queries {
+		q := sq.Embedding
+		// Determine which cluster this query belongs to via keyword bin
+		targetCluster := 0
+		if sq.ClusterIdx < len(keywordBins) && sq.QueryIdx < len(keywordBins[sq.ClusterIdx]) {
+			targetCluster = keywordBins[sq.ClusterIdx][sq.QueryIdx]
+		}
+
+		// Only advertisers in the target cluster may bid
+		var bids []core.CoreBid
+		bidderMap := make(map[string]*Advertiser)
+		for _, adv := range advs {
+			if adv.Cluster == targetCluster && adv.Budget > adv.Price {
+				bids = append(bids, adv.MakeBid())
+				bidderMap[adv.Name] = adv
+			}
+		}
+		if len(bids) == 0 {
+			continue
+		}
+
+		// Price-only second-price auction (no embedding scoring)
+		result := core.RunAuction(bids, nil, 0)
+		if result.Winner == nil {
+			continue
+		}
+		winner := bidderMap[result.Winner.Bidder]
+		if winner == nil {
+			continue
+		}
+
+		value := winner.ValueAt(q)
+		maxVal := 0.0
+		for _, adv := range advs {
+			v := adv.ValueAt(q)
+			if v > maxVal {
+				maxVal = v
+			}
+		}
+
+		// Second-price payment
+		payment := winner.Price
+		if result.RunnerUp != nil {
+			payment = result.RunnerUp.Price
+		}
+		// Individual rationality cap
+		if payment > value {
+			payment = value
+		}
+
+		winner.RoundWins++
+		winner.RoundSpend += payment
+		winner.RoundValueWon += value
+		winner.TotalWins++
+		winner.TotalSpend += payment
+		winner.TotalValueWon += value
+		winner.Budget -= payment
+		revenue += payment
+
+		qType := QueryGeneral
+		if globalQueryTypes != nil && sq.ClusterIdx < len(globalQueryTypes) && sq.QueryIdx < len(globalQueryTypes[sq.ClusterIdx]) {
+			qType = globalQueryTypes[sq.ClusterIdx][sq.QueryIdx]
+		}
+
+		pqResults = append(pqResults, perQueryResult{
+			WinnerValue: value,
+			MaxValue:    maxVal,
+			WinnerName:  winner.Name,
+			QueryType:   qType,
+		})
+
+		winner.RoundQueries = append(winner.RoundQueries, queryResult{
+			Query: q, Value: value, Won: true, Payment: payment,
+		})
+
+		for name, adv := range bidderMap {
+			if name != winner.Name {
+				adv.RoundQueries = append(adv.RoundQueries, queryResult{
+					Query: q, Value: adv.ValueAt(q), Won: false, Payment: 0,
+				})
+			}
+		}
+	}
+	return revenue, pqResults
+}
+
+// runKeywordHotellingTrial runs a keyword-based trial (Cell A).
+func runKeywordHotellingTrial(valueDecay float64, seed int64) HotellingTrialResult {
+	nClusters := len(clusterTightnessLabels)
+	rng := rand.New(rand.NewSource(seed))
+	pub := NewPublisher(seed)
+	advs := makeAdvertisers(rng, valueDecay)
+
+	var evalPQResults []perQueryResult
+	convergedAt := 0
+	stableCount := 0
+
+	for round := 1; round <= maxRounds; round++ {
+		prev := snapshotAdvs(advs)
+
+		for _, adv := range advs {
+			adv.ResetRound()
+		}
+
+		queries := pub.SampleImpressions(impressionsPerRound)
+		_, pqResults := runKeywordAuctionRound(advs, queries)
+
+		for _, adv := range advs {
+			adv.AdaptKeyword()
+		}
+
+		if round > maxRounds-evalWindow {
+			evalPQResults = append(evalPQResults, pqResults...)
+		}
+
+		if convergedAt == 0 {
+			if hasConverged(prev, advs, convergenceEpsilon) {
+				stableCount++
+				if stableCount >= convergenceWindow {
+					convergedAt = round
+				}
+			} else {
+				stableCount = 0
+			}
+		}
+	}
+
+	return computeClusterMetrics(advs, evalPQResults, convergedAt, nClusters)
+}
+
+// uniformLambdas creates a slice of identical λ values for all clusters.
+func uniformLambdas(lambda float64) []float64 {
+	n := len(clusterTightnessLabels)
+	ls := make([]float64, n)
+	for i := range ls {
+		ls[i] = lambda
+	}
+	return ls
 }
 
 // --- Experiment 0: Distance Validation ---
@@ -1003,32 +1012,48 @@ func runDistanceValidation() {
 	for _, ad := range advertiserData {
 		clusterMembers[ad.Cluster] = append(clusterMembers[ad.Cluster], ad.Name)
 	}
-	fmt.Printf("\n  K-means clusters:\n")
-	for c := 0; c < 4; c++ {
+	nClusters := len(clusterTightnessLabels)
+	fmt.Printf("\n  Cluster assignments:\n")
+	for c := 0; c < nClusters; c++ {
 		if members, ok := clusterMembers[c]; ok {
-			fmt.Printf("    Cluster %d: %s\n", c, strings.Join(members, ", "))
+			fmt.Printf("    Cluster %d (%s): %s\n", c, clusterTightnessLabels[c], strings.Join(members, ", "))
 		}
 	}
 
-	// Intra-cluster distances
-	fmt.Printf("\n  Intra-cluster advertiser distances:\n")
-	fmt.Printf("  %-20s %-20s  %-8s  %s\n", "Advertiser A", "Advertiser B", "cos", "cluster")
-	fmt.Println("  " + strings.Repeat("-", 60))
-
-	for i := range advertiserData {
-		for j := i + 1; j < len(advertiserData); j++ {
-			if advertiserData[i].Cluster == advertiserData[j].Cluster {
-				cos := cosineSim(advertiserData[i].Embedding, advertiserData[j].Embedding)
-				fmt.Printf("  %-20s %-20s  %-8.4f  c%d\n",
-					advertiserData[i].Name, advertiserData[j].Name, cos, advertiserData[i].Cluster)
+	// Intra-cluster cosine similarities with per-cluster summary
+	fmt.Printf("\n  Intra-cluster cosine similarities:\n")
+	for c := 0; c < nClusters; c++ {
+		var cosVals []float64
+		for i := range advertiserData {
+			for j := i + 1; j < len(advertiserData); j++ {
+				if advertiserData[i].Cluster == c && advertiserData[j].Cluster == c {
+					cos := cosineSim(advertiserData[i].Embedding, advertiserData[j].Embedding)
+					cosVals = append(cosVals, cos)
+					fmt.Printf("    [c%d %s] %-15s ↔ %-15s  cos=%.4f\n",
+						c, clusterTightnessLabels[c], advertiserData[i].Name, advertiserData[j].Name, cos)
+				}
 			}
+		}
+		if len(cosVals) > 0 {
+			mean, _ := sampleMeanStd(cosVals)
+			min, max := cosVals[0], cosVals[0]
+			for _, v := range cosVals {
+				if v < min {
+					min = v
+				}
+				if v > max {
+					max = v
+				}
+			}
+			fmt.Printf("    → Cluster %d (%s) mean=%.4f  min=%.4f  max=%.4f\n\n",
+				c, clusterTightnessLabels[c], mean, min, max)
 		}
 	}
 
 	// Cross-cluster nearest pairs
-	fmt.Printf("\n  Cross-cluster nearest pairs:\n")
-	for ci := 0; ci < 4; ci++ {
-		for cj := ci + 1; cj < 4; cj++ {
+	fmt.Printf("  Cross-cluster nearest pairs:\n")
+	for ci := 0; ci < nClusters; ci++ {
+		for cj := ci + 1; cj < nClusters; cj++ {
 			bestCos := -1.0
 			bestA, bestB := "", ""
 			for i := range advertiserData {
@@ -1124,7 +1149,6 @@ func runCalibration() float64 {
 		fmt.Printf("    dist²=%.4f cos=%.3f  %-20s ↔ %s\n", p.dist2, 1-p.dist2/2, p.adv, p.query)
 	}
 
-	// Value at different decay values
 	decays := []float64{0.2, 0.3, 0.4, 0.5}
 	examples := []distPair{
 		allPairs[0],
@@ -1156,7 +1180,6 @@ func runCalibration() float64 {
 		100*math.Exp(-allPairs[len(allPairs)-1].dist2/chosen),
 		math.Exp(-allPairs[0].dist2/chosen)/math.Exp(-allPairs[len(allPairs)-1].dist2/chosen))
 
-	// Print query type distribution
 	globalQueryTypes = computeQueryTypes(chosen)
 	counts := [3]int{}
 	for _, types := range globalQueryTypes {
@@ -1170,269 +1193,300 @@ func runCalibration() float64 {
 	return chosen
 }
 
-// --- Cell result collection ---
+// --- Hotelling Analysis ---
 
-type CellResult struct {
-	ValEff    []float64
-	BoundDiv  []float64
-	WinDiv    []float64
-	AdvSurp   []float64
-	PubRev    []float64
-	Drift     []float64
-	Converged []float64 // round at which converged, 0=never
-	SpecSurp  []float64
-	GenSurp   []float64
-}
-
-func collectCellResult(results []TrialResult) CellResult {
-	n := len(results)
-	cr := CellResult{
-		ValEff:    make([]float64, n),
-		BoundDiv:  make([]float64, n),
-		WinDiv:    make([]float64, n),
-		AdvSurp:   make([]float64, n),
-		PubRev:    make([]float64, n),
-		Drift:     make([]float64, n),
-		Converged: make([]float64, n),
-		SpecSurp:  make([]float64, n),
-		GenSurp:   make([]float64, n),
-	}
-	for i, r := range results {
-		cr.ValEff[i] = r.ValueEfficiency
-		cr.BoundDiv[i] = r.BoundaryDiversity
-		cr.WinDiv[i] = r.WinDiversity
-		cr.AdvSurp[i] = r.AdvSurplus
-		cr.PubRev[i] = r.PubRevenue
-		cr.Drift[i] = r.AvgDrift
-		cr.Converged[i] = float64(r.ConvergedAtRound)
-		cr.SpecSurp[i] = r.SpecialistSurplus
-		cr.GenSurp[i] = r.GeneralistSurplus
-	}
-	return cr
-}
-
-func printCellResult(cr CellResult) {
-	fmt.Printf("    Value efficiency:    %s\n", fmtStats(cr.ValEff))
-	fmt.Printf("    Boundary diversity:  %s\n", fmtStats(cr.BoundDiv))
-	fmt.Printf("    Win diversity:       %s\n", fmtStats(cr.WinDiv))
-	fmt.Printf("    Avg surplus/round:   %s\n", fmtStats(cr.AdvSurp))
-	fmt.Printf("    Specialist surplus:  %s\n", fmtStats(cr.SpecSurp))
-	fmt.Printf("    Generalist surplus:  %s\n", fmtStats(cr.GenSurp))
-	fmt.Printf("    Pub revenue/round:   %s\n", fmtStats(cr.PubRev))
-	fmt.Printf("    Avg drift:           %s\n", fmtStats(cr.Drift))
-
-	// Convergence summary
-	converged := 0
-	for _, c := range cr.Converged {
-		if c > 0 {
-			converged++
-		}
-	}
-	fmt.Printf("    Converged:           %d/%d trials\n", converged, len(cr.Converged))
-}
-
-// --- Experiment 2: Cell A — Keyword Baseline ---
-
-func runKeywordBaseline(valueDecay float64) CellResult {
-	name := "Experiment 2: Cell A — Keyword Bins (discrete bins, price-only)"
+func runHotellingAnalysis(valueDecay float64) {
+	nClusters := len(clusterTightnessLabels)
+	name := "Experiment 2: Hotelling Drift × Cluster Tightness"
 	fmt.Printf("\n%s\n%s\n", name, strings.Repeat("=", len(name)))
 
-	const trials = 50
-	results := make([]TrialResult, trials)
-	for i := range results {
-		results[i] = runTrial(0, valueDecay, true, makeAdvertisers, int64(i*7919+42))
+	// 1. Cluster density table
+	density := computeClusterDensity()
+	fmt.Printf("\n  Cluster density (mean pairwise cosine):\n")
+	for c := 0; c < nClusters; c++ {
+		fmt.Printf("    Cluster %d (%s): %.4f\n", c, clusterTightnessLabels[c], density[c])
 	}
 
-	cr := collectCellResult(results)
-	fmt.Printf("\n  Trials: %d  |  keyword bins, price-only  |  %d rounds\n",
-		trials, maxRounds)
-	printCellResult(cr)
-	return cr
-}
-
-// --- Experiment 3: Cell C — Embeddings, No Fees ---
-
-func runEmbeddingsNoFees(valueDecay float64) CellResult {
-	name := "Experiment 3: Cell C — Embeddings, No Fees (λ=0)"
-	fmt.Printf("\n%s\n%s\n", name, strings.Repeat("=", len(name)))
-
+	// 2. Lambda sweep (uniform) → optimal λ
+	lambdaValues := []float64{500, 1000, 2500, 5000, 10000}
 	const trials = 50
-	results := make([]TrialResult, trials)
-	for i := range results {
-		results[i] = runTrial(0, valueDecay, false, makeAdvertisers, int64(i*7919+42))
-	}
 
-	cr := collectCellResult(results)
-	fmt.Printf("\n  Trials: %d  |  embedding scoring, free σ/position  |  λ=0  |  %d rounds\n",
-		trials, maxRounds)
-	printCellResult(cr)
-	return cr
-}
-
-// --- Experiment 4: Cell D — Embeddings, With Fees ---
-
-func runEmbeddingsWithFees(valueDecay float64) (CellResult, float64) {
-	name := "Experiment 4: Cell D — Embeddings, With Fees (λ sweep)"
-	fmt.Printf("\n%s\n%s\n", name, strings.Repeat("=", len(name)))
-
-	lambdas := []float64{500, 1000, 2500, 5000, 10000}
-	const trials = 50
+	fmt.Printf("\n  Lambda sweep (%d trials each, %d rounds):\n", trials, maxRounds)
+	fmt.Printf("  %-8s  %-12s  %-12s  %-12s\n", "Lambda", "ValEff", "AvgDrift", "Converged")
+	fmt.Println("  " + strings.Repeat("-", 50))
 
 	type sweepEntry struct {
-		Lambda float64
-		Cell   CellResult
+		lambda  float64
+		results []HotellingTrialResult
 	}
+	var sweepResults []sweepEntry
 
-	entries := make([]sweepEntry, len(lambdas))
-	for li, lambda := range lambdas {
-		trialResults := make([]TrialResult, trials)
+	for _, lambda := range lambdaValues {
+		trialResults := make([]HotellingTrialResult, trials)
 		for i := range trialResults {
-			trialResults[i] = runTrial(lambda, valueDecay, false, makeAdvertisers, int64(i*7919+42))
+			trialResults[i] = runHotellingTrial(uniformLambdas(lambda), valueDecay, int64(i*7919+42))
 		}
-		entries[li] = sweepEntry{Lambda: lambda, Cell: collectCellResult(trialResults)}
+		sweepResults = append(sweepResults, sweepEntry{lambda, trialResults})
+
+		veVals := make([]float64, trials)
+		driftVals := make([]float64, trials)
+		nConverged := 0
+		for i, r := range trialResults {
+			veVals[i] = r.ValueEfficiency
+			driftVals[i] = r.AvgDrift
+			if r.ConvergedAtRound > 0 {
+				nConverged++
+			}
+		}
+		mve, _ := sampleMeanStd(veVals)
+		mdr, _ := sampleMeanStd(driftVals)
+		fmt.Printf("  %-8.0f  %-12.4f  %-12.4f  %d/%d\n", lambda, mve, mdr, nConverged, trials)
 	}
 
-	// Print sweep table
-	fmt.Printf("\n  %-8s  %-12s  %-12s  %-12s  %-12s  %-12s\n",
-		"Lambda", "ValEff", "BoundDiv", "WinDiv", "Surplus/rnd", "PubRev/rnd")
-	fmt.Println("  " + strings.Repeat("-", 72))
-
-	for _, e := range entries {
-		mve, _ := sampleMeanStd(e.Cell.ValEff)
-		mbd, _ := sampleMeanStd(e.Cell.BoundDiv)
-		mwd, _ := sampleMeanStd(e.Cell.WinDiv)
-		ms, _ := sampleMeanStd(e.Cell.AdvSurp)
-		mr, _ := sampleMeanStd(e.Cell.PubRev)
-		fmt.Printf("  %-8.0f  %-12.4f  %-12.4f  %-12.4f  %-12.4f  %-12.2f\n",
-			e.Lambda, mve, mbd, mwd, ms, mr)
-	}
-
-	// Select optimal λ: highest value efficiency
+	// Select optimal λ by highest value efficiency
 	bestIdx := 0
 	bestValEff := -1.0
-	for i, e := range entries {
-		mve, _ := sampleMeanStd(e.Cell.ValEff)
+	for i, se := range sweepResults {
+		veVals := make([]float64, trials)
+		for j, r := range se.results {
+			veVals[j] = r.ValueEfficiency
+		}
+		mve, _ := sampleMeanStd(veVals)
 		if mve > bestValEff {
 			bestValEff = mve
 			bestIdx = i
 		}
 	}
-
-	optLambda := entries[bestIdx].Lambda
+	optLambda := sweepResults[bestIdx].lambda
 	fmt.Printf("\n  Optimal λ = %.0f (value efficiency = %.4f)\n", optLambda, bestValEff)
 
-	cr := entries[bestIdx].Cell
-	fmt.Printf("\n  Cell D results at λ=%.0f:\n", optLambda)
-	printCellResult(cr)
+	// 3. Run Cells A, C, D, E — all 50 trials, same seeds
+	fmt.Printf("\n  Running Cell A (keyword), Cell C (λ=0), Cell D (λ=%.0f), Cell E (adaptive λ), %d trials each...\n", optLambda, trials)
 
-	return cr, optLambda
-}
+	// Compute adaptive lambdas: λ_c = optLambda * density_c / meanDensity
+	meanDensity := 0.0
+	for _, d := range density {
+		meanDensity += d
+	}
+	meanDensity /= float64(nClusters)
 
-// --- Experiment 5: Comparison with statistical tests ---
-
-func runComparison(cellA, cellC, cellD CellResult, optLambda float64) {
-	name := "Experiment 5: Comparison Table"
-	fmt.Printf("\n%s\n%s\n", name, strings.Repeat("=", len(name)))
-
-	type metricRow struct {
-		name   string
-		a, c, d []float64
-		fmt    string
+	adaptiveLambdas := make([]float64, nClusters)
+	for c := 0; c < nClusters; c++ {
+		adaptiveLambdas[c] = optLambda * density[c] / meanDensity
+	}
+	fmt.Printf("\n  Adaptive λ schedule (optλ=%.0f, mean density=%.4f):\n", optLambda, meanDensity)
+	for c := 0; c < nClusters; c++ {
+		fmt.Printf("    Cluster %d (%s): λ=%.0f (density=%.4f)\n", c, clusterTightnessLabels[c], adaptiveLambdas[c], density[c])
 	}
 
-	rows := []metricRow{
-		{"Value efficiency", cellA.ValEff, cellC.ValEff, cellD.ValEff, "%.4f"},
-		{"Boundary diversity", cellA.BoundDiv, cellC.BoundDiv, cellD.BoundDiv, "%.4f"},
-		{"Win diversity", cellA.WinDiv, cellC.WinDiv, cellD.WinDiv, "%.4f"},
-		{"Avg surplus/round", cellA.AdvSurp, cellC.AdvSurp, cellD.AdvSurp, "%.4f"},
-		{"Specialist surplus", cellA.SpecSurp, cellC.SpecSurp, cellD.SpecSurp, "%.4f"},
-		{"Generalist surplus", cellA.GenSurp, cellC.GenSurp, cellD.GenSurp, "%.4f"},
-		{"Pub revenue/round", cellA.PubRev, cellC.PubRev, cellD.PubRev, "%.2f"},
-		{"Avg drift", cellA.Drift, cellC.Drift, cellD.Drift, "%.4f"},
+	cellAResults := make([]HotellingTrialResult, trials)
+	cellCResults := make([]HotellingTrialResult, trials)
+	cellDResults := make([]HotellingTrialResult, trials)
+	cellEResults := make([]HotellingTrialResult, trials)
+	for i := 0; i < trials; i++ {
+		seed := int64(i*7919 + 42)
+		cellAResults[i] = runKeywordHotellingTrial(valueDecay, seed)
+		cellCResults[i] = runHotellingTrial(uniformLambdas(0), valueDecay, seed)
+		cellDResults[i] = runHotellingTrial(uniformLambdas(optLambda), valueDecay, seed)
+		cellEResults[i] = runHotellingTrial(adaptiveLambdas, valueDecay, seed)
 	}
 
-	fmt.Printf("\n  %-22s  %-16s  %-16s  %-16s  %-6s  %-6s\n",
-		"Metric", "Cell A (kw)", "Cell C (emb)", fmt.Sprintf("Cell D (λ=%.0f)", optLambda), "A↔C", "C↔D")
-	fmt.Println("  " + strings.Repeat("-", 90))
-
-	for _, r := range rows {
-		ma, sa := sampleMeanStd(r.a)
-		mc, sc := sampleMeanStd(r.c)
-		md, sd := sampleMeanStd(r.d)
-		_, pac := welchT(r.a, r.c)
-		_, pcd := welchT(r.c, r.d)
-
-		aStr := fmt.Sprintf(r.fmt+"±"+r.fmt, ma, sa)
-		cStr := fmt.Sprintf(r.fmt+"±"+r.fmt, mc, sc)
-		dStr := fmt.Sprintf(r.fmt+"±"+r.fmt, md, sd)
-		fmt.Printf("  %-22s  %-16s  %-16s  %-16s  %-6s  %-6s\n",
-			r.name, aStr, cStr, dStr, sigStars(pac), sigStars(pcd))
-	}
-
-	// Keyword regression analysis
-	mveA, _ := sampleMeanStd(cellA.ValEff)
-	mveC, _ := sampleMeanStd(cellC.ValEff)
-	mveD, _ := sampleMeanStd(cellD.ValEff)
-
-	fmt.Printf("\n  Keyword regression analysis:\n")
-	if mveD != mveA {
-		ratio := (mveC - mveA) / (mveD - mveA)
-		fmt.Printf("    Value efficiency: C captures %.0f%% of D's improvement over A\n", ratio*100)
-	}
-
-	mbdA, _ := sampleMeanStd(cellA.BoundDiv)
-	mbdC, _ := sampleMeanStd(cellC.BoundDiv)
-	mbdD, _ := sampleMeanStd(cellD.BoundDiv)
-	if mbdD != mbdA {
-		ratio := (mbdC - mbdA) / (mbdD - mbdA)
-		fmt.Printf("    Boundary diversity: C captures %.0f%% of D's improvement over A\n", ratio*100)
-	}
-
-	fmt.Printf("\n  Key insight: ")
-	_, pAC := welchT(cellA.ValEff, cellC.ValEff)
-	_, pCD := welchT(cellC.ValEff, cellD.ValEff)
-
-	if mveD > mveC && pCD < 0.05 {
-		fmt.Println("Relocation fees significantly improve value efficiency over unpenalized embeddings.")
-	} else if mveC > mveA && pAC < 0.05 {
-		if pCD >= 0.05 {
-			fmt.Println("Embeddings significantly improve over keywords. Fees do not provide additional significant benefit.")
-		} else {
-			fmt.Println("Embeddings improve over keywords, and fees further improve over unpenalized embeddings.")
+	// Helper to extract per-cluster metric from trial results
+	extractCluster := func(results []HotellingTrialResult, c int, getter func(HotellingTrialResult) float64) []float64 {
+		vals := make([]float64, len(results))
+		for i, r := range results {
+			vals[i] = getter(r)
 		}
-	} else {
-		fmt.Println("No statistically significant differences detected between cells.")
+		return vals
 	}
 
-	// Specialist/Generalist analysis
-	fmt.Printf("\n  Specialist vs Generalist analysis:\n")
-	mssA, _ := sampleMeanStd(cellA.SpecSurp)
-	mssC, _ := sampleMeanStd(cellC.SpecSurp)
-	mgsA, _ := sampleMeanStd(cellA.GenSurp)
-	mgsC, _ := sampleMeanStd(cellC.GenSurp)
-	_, pSpecAC := welchT(cellA.SpecSurp, cellC.SpecSurp)
-	_, pGenAC := welchT(cellA.GenSurp, cellC.GenSurp)
+	// 4. Per-cluster comparison table: A vs C vs D vs E
+	for c := 0; c < nClusters; c++ {
+		fmt.Printf("\n  ── Cluster %d (%s, density=%.4f) ──\n", c, clusterTightnessLabels[c], density[c])
 
-	if mssC > mssA && pSpecAC < 0.05 {
-		fmt.Printf("    Embeddings significantly INCREASE specialist surplus (%.4f → %.4f, %s)\n",
-			mssA, mssC, sigStars(pSpecAC))
-	} else if mssC < mssA && pSpecAC < 0.05 {
-		fmt.Printf("    Embeddings significantly DECREASE specialist surplus (%.4f → %.4f, %s)\n",
-			mssA, mssC, sigStars(pSpecAC))
-	} else {
-		fmt.Printf("    No significant change in specialist surplus (%.4f → %.4f, %s)\n",
-			mssA, mssC, sigStars(pSpecAC))
+		surpA := extractCluster(cellAResults, c, func(r HotellingTrialResult) float64 { return r.ClusterSurplus[c] })
+		surpC := extractCluster(cellCResults, c, func(r HotellingTrialResult) float64 { return r.ClusterSurplus[c] })
+		surpD := extractCluster(cellDResults, c, func(r HotellingTrialResult) float64 { return r.ClusterSurplus[c] })
+		surpE := extractCluster(cellEResults, c, func(r HotellingTrialResult) float64 { return r.ClusterSurplus[c] })
+
+		driftC := extractCluster(cellCResults, c, func(r HotellingTrialResult) float64 { return r.ClusterDrift[c] })
+		driftD := extractCluster(cellDResults, c, func(r HotellingTrialResult) float64 { return r.ClusterDrift[c] })
+
+		cpC := extractCluster(cellCResults, c, func(r HotellingTrialResult) float64 { return r.CentripetalFraction[c] })
+		cpD := extractCluster(cellDResults, c, func(r HotellingTrialResult) float64 { return r.CentripetalFraction[c] })
+
+		mSA, _ := sampleMeanStd(surpA)
+		mSC, _ := sampleMeanStd(surpC)
+		mSD, _ := sampleMeanStd(surpD)
+		mSE, _ := sampleMeanStd(surpE)
+
+		mDrC, _ := sampleMeanStd(driftC)
+		mDrD, _ := sampleMeanStd(driftD)
+		_, pDr := welchT(driftC, driftD)
+
+		mCpC, _ := sampleMeanStd(cpC)
+		mCpD, _ := sampleMeanStd(cpD)
+		_, pCp := welchT(cpC, cpD)
+
+		_, pSurpAC := welchT(surpA, surpC)
+		_, pSurpAD := welchT(surpA, surpD)
+		_, pSurpDE := welchT(surpD, surpE)
+
+		fmt.Printf("    %-24s  %-10s  %-10s  %-10s  %-10s\n", "Metric", "Cell A", "Cell C", "Cell D", "Cell E")
+		fmt.Println("    " + strings.Repeat("-", 68))
+		fmt.Printf("    %-24s  %-10.4f  %-10.4f  %-10.4f  %-10.4f\n", "Surplus/round/adv", mSA, mSC, mSD, mSE)
+		fmt.Printf("    %-24s  %-10s  %-10.4f  %-10.4f  %-10s\n", "Drift magnitude", "n/a", mDrC, mDrD, "n/a")
+		fmt.Printf("    %-24s  %-10s  %-10.4f  %-10.4f  %-10s\n", "Centripetal fraction", "n/a", mCpC, mCpD, "n/a")
+		fmt.Printf("    Surplus A↔C: p=%.4f %s  A↔D: p=%.4f %s  D↔E: p=%.4f %s\n",
+			pSurpAC, sigStars(pSurpAC), pSurpAD, sigStars(pSurpAD), pSurpDE, sigStars(pSurpDE))
+		fmt.Printf("    Drift C↔D: p=%.4f %s  Centripetal C↔D: p=%.4f %s\n", pDr, sigStars(pDr), pCp, sigStars(pCp))
 	}
 
-	if mgsC > mgsA && pGenAC < 0.05 {
-		fmt.Printf("    Embeddings significantly INCREASE generalist surplus (%.4f → %.4f, %s)\n",
-			mgsA, mgsC, sigStars(pGenAC))
-	} else if mgsC < mgsA && pGenAC < 0.05 {
-		fmt.Printf("    Embeddings significantly DECREASE generalist surplus (%.4f → %.4f, %s)\n",
-			mgsA, mgsC, sigStars(pGenAC))
+	// 5. Aggregate comparison: A vs C vs D vs E
+	fmt.Printf("\n  ── Aggregate Comparison ──\n")
+	veA := make([]float64, trials)
+	veC := make([]float64, trials)
+	veD := make([]float64, trials)
+	veE := make([]float64, trials)
+	for i := 0; i < trials; i++ {
+		veA[i] = cellAResults[i].ValueEfficiency
+		veC[i] = cellCResults[i].ValueEfficiency
+		veD[i] = cellDResults[i].ValueEfficiency
+		veE[i] = cellEResults[i].ValueEfficiency
+	}
+	mVeA, _ := sampleMeanStd(veA)
+	mVeC, _ := sampleMeanStd(veC)
+	mVeD, _ := sampleMeanStd(veD)
+	mVeE, _ := sampleMeanStd(veE)
+
+	fmt.Printf("    %-24s  %-10s  %-10s  %-10s  %-10s\n", "Metric", "Cell A", "Cell C", "Cell D", "Cell E")
+	fmt.Println("    " + strings.Repeat("-", 68))
+	fmt.Printf("    %-24s  %-10.4f  %-10.4f  %-10.4f  %-10.4f\n", "Value efficiency", mVeA, mVeC, mVeD, mVeE)
+
+	// Per-cell aggregate surplus
+	aggSurpA := make([]float64, trials)
+	aggSurpC := make([]float64, trials)
+	aggSurpD := make([]float64, trials)
+	aggSurpE := make([]float64, trials)
+	for i := 0; i < trials; i++ {
+		for c := 0; c < nClusters; c++ {
+			aggSurpA[i] += cellAResults[i].ClusterSurplus[c]
+			aggSurpC[i] += cellCResults[i].ClusterSurplus[c]
+			aggSurpD[i] += cellDResults[i].ClusterSurplus[c]
+			aggSurpE[i] += cellEResults[i].ClusterSurplus[c]
+		}
+		aggSurpA[i] /= float64(nClusters)
+		aggSurpC[i] /= float64(nClusters)
+		aggSurpD[i] /= float64(nClusters)
+		aggSurpE[i] /= float64(nClusters)
+	}
+	mSA, _ := sampleMeanStd(aggSurpA)
+	mSC, _ := sampleMeanStd(aggSurpC)
+	mSD, _ := sampleMeanStd(aggSurpD)
+	mSE, _ := sampleMeanStd(aggSurpE)
+	fmt.Printf("    %-24s  %-10.4f  %-10.4f  %-10.4f  %-10.4f\n", "Avg surplus/round/adv", mSA, mSC, mSD, mSE)
+
+	_, pAC := welchT(aggSurpA, aggSurpC)
+	_, pAD := welchT(aggSurpA, aggSurpD)
+	_, pCD := welchT(aggSurpC, aggSurpD)
+	_, pDE := welchT(aggSurpD, aggSurpE)
+	fmt.Printf("    Surplus: A↔C p=%.4f %s  A↔D p=%.4f %s  C↔D p=%.4f %s  D↔E p=%.4f %s\n",
+		pAC, sigStars(pAC), pAD, sigStars(pAD), pCD, sigStars(pCD), pDE, sigStars(pDE))
+
+	// 6. Tightness × fee effect correlation (n=5)
+	fmt.Printf("\n  ── Tightness × Fee Effect Correlation (n=%d) ──\n", nClusters)
+
+	tightnessVals := make([]float64, nClusters)
+	surplusImprovement := make([]float64, nClusters)
+	driftReduction := make([]float64, nClusters)
+	cpChange := make([]float64, nClusters)
+
+	for c := 0; c < nClusters; c++ {
+		tightnessVals[c] = density[c]
+
+		surpC := extractCluster(cellCResults, c, func(r HotellingTrialResult) float64 { return r.ClusterSurplus[c] })
+		surpD := extractCluster(cellDResults, c, func(r HotellingTrialResult) float64 { return r.ClusterSurplus[c] })
+		driftC := extractCluster(cellCResults, c, func(r HotellingTrialResult) float64 { return r.ClusterDrift[c] })
+		driftD := extractCluster(cellDResults, c, func(r HotellingTrialResult) float64 { return r.ClusterDrift[c] })
+		cpCv := extractCluster(cellCResults, c, func(r HotellingTrialResult) float64 { return r.CentripetalFraction[c] })
+		cpDv := extractCluster(cellDResults, c, func(r HotellingTrialResult) float64 { return r.CentripetalFraction[c] })
+
+		mSCv, _ := sampleMeanStd(surpC)
+		mSDv, _ := sampleMeanStd(surpD)
+		surplusImprovement[c] = mSDv - mSCv
+
+		mDCv, _ := sampleMeanStd(driftC)
+		mDDv, _ := sampleMeanStd(driftD)
+		driftReduction[c] = mDCv - mDDv
+
+		mCCv, _ := sampleMeanStd(cpCv)
+		mCDv, _ := sampleMeanStd(cpDv)
+		cpChange[c] = mCDv - mCCv
+	}
+
+	fmt.Printf("    %-12s  %-10s  %-14s  %-14s  %-14s\n",
+		"Cluster", "Density", "ΔSurplus(D-C)", "ΔDrift(C-D)", "ΔCentripetal")
+	fmt.Println("    " + strings.Repeat("-", 70))
+	for c := 0; c < nClusters; c++ {
+		fmt.Printf("    %-12s  %-10.4f  %-14.4f  %-14.4f  %-14.4f\n",
+			clusterTightnessLabels[c], tightnessVals[c], surplusImprovement[c], driftReduction[c], cpChange[c])
+	}
+
+	rSurplus := pearsonR(tightnessVals, surplusImprovement)
+	rDrift := pearsonR(tightnessVals, driftReduction)
+	rCp := pearsonR(tightnessVals, cpChange)
+
+	fmt.Printf("\n    Pearson r (density × ΔSurplus):      %.4f  (n=%d)\n", rSurplus, nClusters)
+	fmt.Printf("    Pearson r (density × ΔDrift):        %.4f  (n=%d)\n", rDrift, nClusters)
+	fmt.Printf("    Pearson r (density × ΔCentripetal):  %.4f  (n=%d)\n", rCp, nClusters)
+
+	// 7. Cell D vs Cell E comparison (uniform vs adaptive)
+	fmt.Printf("\n  ── Cell D (uniform λ) vs Cell E (adaptive λ) ──\n")
+	for c := 0; c < nClusters; c++ {
+		surpD := extractCluster(cellDResults, c, func(r HotellingTrialResult) float64 { return r.ClusterSurplus[c] })
+		surpE := extractCluster(cellEResults, c, func(r HotellingTrialResult) float64 { return r.ClusterSurplus[c] })
+		mDv, _ := sampleMeanStd(surpD)
+		mEv, _ := sampleMeanStd(surpE)
+		_, p := welchT(surpD, surpE)
+		fmt.Printf("    Cluster %d (%s): D=%.4f  E=%.4f  Δ=%.4f  p=%.4f %s\n",
+			c, clusterTightnessLabels[c], mDv, mEv, mEv-mDv, p, sigStars(p))
+	}
+
+	// 8. Key findings
+	fmt.Printf("\n  ── Key Findings ──\n")
+
+	allCpPositive := true
+	for c := 0; c < nClusters; c++ {
+		cpCv := extractCluster(cellCResults, c, func(r HotellingTrialResult) float64 { return r.CentripetalFraction[c] })
+		mCp, _ := sampleMeanStd(cpCv)
+		if mCp <= 0 {
+			allCpPositive = false
+			fmt.Printf("    [!] Cluster %d (%s): centripetal fraction = %.4f (NOT positive)\n",
+				c, clusterTightnessLabels[c], mCp)
+		} else {
+			fmt.Printf("    [+] Cluster %d (%s): centripetal fraction = %.4f (positive → Hotelling drift)\n",
+				c, clusterTightnessLabels[c], mCp)
+		}
+	}
+
+	if allCpPositive {
+		fmt.Println("    → Hotelling drift detected in all clusters under free positioning (Cell C)")
+	}
+
+	if rSurplus > 0.5 {
+		fmt.Printf("    → Fee effect scales with tightness (r=%.2f, n=%d): tighter clusters benefit more from fees\n", rSurplus, nClusters)
+	} else if rSurplus < -0.5 {
+		fmt.Printf("    → Fee effect inversely scales with tightness (r=%.2f, n=%d): looser clusters benefit more\n", rSurplus, nClusters)
 	} else {
-		fmt.Printf("    No significant change in generalist surplus (%.4f → %.4f, %s)\n",
-			mgsA, mgsC, sigStars(pGenAC))
+		fmt.Printf("    → No strong correlation between tightness and fee effect (r=%.2f, n=%d)\n", rSurplus, nClusters)
+	}
+
+	// Adaptive λ finding
+	_, pDEagg := welchT(aggSurpD, aggSurpE)
+	if pDEagg < 0.05 {
+		fmt.Printf("    → Adaptive λ significantly different from uniform (p=%.4f)\n", pDEagg)
+	} else {
+		fmt.Printf("    → Adaptive λ not significantly different from uniform (p=%.4f)\n", pDEagg)
 	}
 }
 
@@ -1445,41 +1499,9 @@ func main() {
 	// Exp 1: Calibrate value decay + compute query types
 	valueDecay := runCalibration()
 
-	// Compute keyword bins and specialist classification
+	// Compute keyword bins for Cell A
 	computeKeywordBins()
-	classifyAdvertisers(valueDecay)
 
-	// Print keyword bin diagnostics
-	fmt.Printf("\n  Keyword bin assignments:\n")
-	for ci, ic := range impressionClusters {
-		for qi := range ic.Queries {
-			label := ""
-			if qi < len(ic.Labels) {
-				label = ic.Labels[qi]
-			}
-			fmt.Printf("    cluster=%d query=%d bin=%d  %s\n", ci, qi, globalKeywordBins[ci][qi], label)
-		}
-	}
-
-	// Print specialist/generalist classification
-	fmt.Printf("\n  Specialist/Generalist classification (median-split on niche query count):\n")
-	for _, ad := range advertiserData {
-		role := "generalist"
-		if globalSpecialists[ad.Name] {
-			role = "specialist"
-		}
-		fmt.Printf("    %-20s → %s\n", ad.Name, role)
-	}
-
-	// Exp 2: Cell A — keyword baseline (discrete bins, price-only)
-	cellA := runKeywordBaseline(valueDecay)
-
-	// Exp 3: Cell C — embeddings, no fees
-	cellC := runEmbeddingsNoFees(valueDecay)
-
-	// Exp 4: Cell D — embeddings, with fees (lambda sweep)
-	cellD, optLambda := runEmbeddingsWithFees(valueDecay)
-
-	// Exp 5: Comparison with statistical tests
-	runComparison(cellA, cellC, cellD, optLambda)
+	// Exp 2: Hotelling drift × cluster tightness analysis
+	runHotellingAnalysis(valueDecay)
 }
