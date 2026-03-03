@@ -1490,6 +1490,416 @@ func runHotellingAnalysis(valueDecay float64) {
 	}
 }
 
+// --- Experiment 3: Log Base & Discovery Threshold ---
+
+type LogBaseTrialResult struct {
+	ValueEfficiency   float64
+	AvgSurplus        float64
+	SpecialistSurplus float64
+	GeneralistSurplus float64
+	RevenuePerRound   float64
+	NoShowRate        float64
+	MeanWinnerCos     float64
+	WinDiversity      float64
+}
+
+func runLogBaseTrial(logBase, discoveryThresh float64, lambdas []float64, valueDecay float64, seed int64) LogBaseTrialResult {
+	distWeight := math.Log(logBase) // ln(b); b=e → distWeight=1
+	sqrtDW := math.Sqrt(distWeight)
+	rng := rand.New(rand.NewSource(seed))
+	pub := NewPublisher(seed)
+	advs := makeAdvertisers(rng, valueDecay)
+
+	totalRevenue := 0.0
+	totalNoShows := 0
+	totalQueries := 0
+	var evalPQResults []perQueryResult
+	var evalWinnerCos []float64
+
+	for round := 1; round <= maxRounds; round++ {
+		for _, adv := range advs {
+			adv.ResetRound()
+		}
+
+		queries := pub.SampleImpressions(impressionsPerRound)
+		roundRevenue := 0.0
+		roundNoShows := 0
+
+		for _, sq := range queries {
+			q := sq.Embedding
+			var bids []core.CoreBid
+			bidderMap := make(map[string]*Advertiser)
+
+			for _, adv := range advs {
+				if adv.Budget > adv.Price && adv.ShouldBid(q) {
+					// Phase 1: Discovery — cosine similarity gate
+					if discoveryThresh > 0 {
+						cos := cosineSim(adv.Center, q)
+						if cos < discoveryThresh {
+							continue
+						}
+					}
+					bid := adv.MakeBid()
+					// Scale sigma to implement log base: score = ln(p) - ln(b)*dist²/σ²
+					// By setting bid.Sigma = σ/√ln(b), we get dist²/(σ/√dw)² = dw*dist²/σ²
+					if distWeight <= 0 {
+						// b=1: s=0, pure rank-by-bid: ignore distance entirely
+						bid.Embedding = nil
+					} else if sqrtDW != 1.0 {
+						bid.Sigma = bid.Sigma / sqrtDW
+					}
+					bids = append(bids, bid)
+					bidderMap[adv.Name] = adv
+				}
+			}
+			if len(bids) == 0 {
+				roundNoShows++
+				continue
+			}
+
+			result := core.RunAuction(bids, nil, 0, q)
+			if result.Winner == nil {
+				roundNoShows++
+				continue
+			}
+			winner := bidderMap[result.Winner.Bidder]
+			if winner == nil {
+				continue
+			}
+
+			value := winner.ValueAt(q)
+			maxVal := 0.0
+			for _, adv := range advs {
+				v := adv.ValueAt(q)
+				if v > maxVal {
+					maxVal = v
+				}
+			}
+
+			// VCG settlement (bid.Sigma already scaled → payment auto-adjusts)
+			var payment float64
+			if result.RunnerUp != nil {
+				ru := bidderMap[result.RunnerUp.Bidder]
+				if ru != nil {
+					if distWeight <= 0 || result.Winner.Embedding == nil {
+						// Pure price auction: VCG payment = runner-up price
+						payment = result.RunnerUp.Price
+					} else {
+						distW2 := squaredDist(result.Winner.Embedding, q)
+						distR2 := squaredDist(result.RunnerUp.Embedding, q)
+						sigmaW := result.Winner.Sigma
+						sigmaR := result.RunnerUp.Sigma
+						payment = result.RunnerUp.Price * math.Exp(distW2/(sigmaW*sigmaW)-distR2/(sigmaR*sigmaR))
+					}
+				} else {
+					payment = result.RunnerUp.Price
+				}
+			} else {
+				payment = winner.Price
+			}
+
+			if payment > value {
+				payment = value
+			}
+			if payment > winner.Price*10 {
+				payment = winner.Price * 10
+			}
+
+			winner.RoundWins++
+			winner.RoundSpend += payment
+			winner.RoundValueWon += value
+			winner.TotalWins++
+			winner.TotalSpend += payment
+			winner.TotalValueWon += value
+			winner.Budget -= payment
+			roundRevenue += payment
+
+			qType := QueryGeneral
+			if globalQueryTypes != nil && sq.ClusterIdx < len(globalQueryTypes) && sq.QueryIdx < len(globalQueryTypes[sq.ClusterIdx]) {
+				qType = globalQueryTypes[sq.ClusterIdx][sq.QueryIdx]
+			}
+
+			evalInWindow := round > maxRounds-evalWindow
+			if evalInWindow {
+				winCos := cosineSim(result.Winner.Embedding, q)
+				evalWinnerCos = append(evalWinnerCos, winCos)
+			}
+
+			pq := perQueryResult{
+				WinnerValue: value,
+				MaxValue:    maxVal,
+				WinnerName:  winner.Name,
+				QueryType:   qType,
+			}
+			if evalInWindow {
+				evalPQResults = append(evalPQResults, pq)
+			}
+
+			winner.RoundQueries = append(winner.RoundQueries, queryResult{
+				Query: q, Value: value, Won: true, Payment: payment,
+			})
+			for name, adv := range bidderMap {
+				if name != winner.Name {
+					adv.RoundQueries = append(adv.RoundQueries, queryResult{
+						Query: q, Value: adv.ValueAt(q), Won: false, Payment: 0,
+					})
+				}
+			}
+		}
+
+		for _, adv := range advs {
+			adv.Adapt(lambdas[adv.Cluster])
+		}
+
+		if round > maxRounds-evalWindow {
+			totalRevenue += roundRevenue
+			totalNoShows += roundNoShows
+			totalQueries += len(queries)
+		}
+	}
+
+	// Compute results
+	var result LogBaseTrialResult
+	result.ValueEfficiency = valueEfficiencyFromResults(evalPQResults)
+	result.RevenuePerRound = totalRevenue / float64(evalWindow)
+
+	if totalQueries > 0 {
+		result.NoShowRate = float64(totalNoShows) / float64(totalQueries)
+	}
+
+	if len(evalWinnerCos) > 0 {
+		sum := 0.0
+		for _, c := range evalWinnerCos {
+			sum += c
+		}
+		result.MeanWinnerCos = sum / float64(len(evalWinnerCos))
+	}
+
+	// Win diversity (normalized inverse HHI)
+	winCounts := make(map[string]int)
+	for _, pq := range evalPQResults {
+		winCounts[pq.WinnerName]++
+	}
+	if len(evalPQResults) > 0 && len(winCounts) > 0 {
+		hhi := 0.0
+		n := float64(len(evalPQResults))
+		for _, count := range winCounts {
+			share := float64(count) / n
+			hhi += share * share
+		}
+		if hhi > 0 {
+			result.WinDiversity = 1.0 / (float64(len(winCounts)) * hhi)
+		}
+	}
+
+	// Surplus
+	nAdvs := float64(len(advs))
+	specCount := 0.0
+	genCount := 0.0
+	specSurplus := 0.0
+	genSurplus := 0.0
+	totalSurplus := 0.0
+	for _, adv := range advs {
+		s := adv.Surplus() / float64(maxRounds)
+		totalSurplus += s
+		if adv.IsSpecialist {
+			specSurplus += s
+			specCount++
+		} else {
+			genSurplus += s
+			genCount++
+		}
+	}
+	result.AvgSurplus = totalSurplus / nAdvs
+	if specCount > 0 {
+		result.SpecialistSurplus = specSurplus / specCount
+	}
+	if genCount > 0 {
+		result.GeneralistSurplus = genSurplus / genCount
+	}
+
+	return result
+}
+
+func runLogBaseExperiment(valueDecay float64) {
+	name := "Experiment 3: Log Base & Discovery Threshold"
+	fmt.Printf("\n%s\n%s\n", name, strings.Repeat("=", len(name)))
+
+	const trials = 50
+	lambda := 5000.0
+	lambdas := uniformLambdas(lambda)
+
+	// --- Part A: Log Base Sweep (fixed τ=0.3) ---
+	discoveryThresh := 0.3
+	fmt.Printf("\n  Part A: Log Base Sweep (τ=%.1f, λ=%.0f, %d trials, %d rounds)\n",
+		discoveryThresh, lambda, trials, maxRounds)
+
+	type baseEntry struct {
+		label string
+		base  float64
+	}
+	bases := []baseEntry{
+		{"b=1.0", 1.0},  // s=0.00: pure rank-by-bid (no distance)
+		{"b=1.1", 1.1},  // s=0.10: very weak distance weight
+		{"b=1.5", 1.5},  // s=0.41: moderate
+		{"b=2", 2},      // s=0.69
+		{"b=e", math.E}, // s=1.00: industry default (baseline)
+		{"b=5", 5},      // s=1.61
+		{"b=10", 10},    // s=2.30
+		{"b=50", 50},    // s=3.91
+	}
+
+	type cellResults struct {
+		label   string
+		results []LogBaseTrialResult
+	}
+	var baseCells []cellResults
+
+	for _, be := range bases {
+		fmt.Printf("    Running %s...\n", be.label)
+		trialResults := make([]LogBaseTrialResult, trials)
+		for i := range trialResults {
+			trialResults[i] = runLogBaseTrial(be.base, discoveryThresh, lambdas, valueDecay, int64(i*7919+42))
+		}
+		baseCells = append(baseCells, cellResults{be.label, trialResults})
+	}
+
+	// Print results table
+	extractLB := func(cells []cellResults, getter func(LogBaseTrialResult) float64) [][]float64 {
+		out := make([][]float64, len(cells))
+		for i, c := range cells {
+			vals := make([]float64, len(c.results))
+			for j, r := range c.results {
+				vals[j] = getter(r)
+			}
+			out[i] = vals
+		}
+		return out
+	}
+
+	printRow := func(name string, cells []cellResults, getter func(LogBaseTrialResult) float64) {
+		vals := extractLB(cells, getter)
+		fmt.Printf("    %-10s", name)
+		for _, v := range vals {
+			m, s := sampleMeanStd(v)
+			fmt.Printf("  %6.4f±%.3f", m, s)
+		}
+		fmt.Println()
+	}
+
+	fmt.Printf("\n    %-10s", "Metric")
+	for _, c := range baseCells {
+		fmt.Printf("  %-13s", c.label)
+	}
+	fmt.Println()
+	fmt.Printf("    %s\n", strings.Repeat("-", 10+15*len(baseCells)))
+
+	printRow("ValEff", baseCells, func(r LogBaseTrialResult) float64 { return r.ValueEfficiency })
+	printRow("Surplus", baseCells, func(r LogBaseTrialResult) float64 { return r.AvgSurplus })
+	printRow("SpecSurp", baseCells, func(r LogBaseTrialResult) float64 { return r.SpecialistSurplus })
+	printRow("GenSurp", baseCells, func(r LogBaseTrialResult) float64 { return r.GeneralistSurplus })
+	printRow("Revenue", baseCells, func(r LogBaseTrialResult) float64 { return r.RevenuePerRound })
+	printRow("WinCos", baseCells, func(r LogBaseTrialResult) float64 { return r.MeanWinnerCos })
+	printRow("NoShow%", baseCells, func(r LogBaseTrialResult) float64 { return r.NoShowRate * 100 })
+	printRow("WinDiv", baseCells, func(r LogBaseTrialResult) float64 { return r.WinDiversity })
+
+	// Significance tests vs b=e
+	baselineIdx := 4
+	fmt.Printf("\n    Significance vs b=e (Welch's t):\n")
+	type metric struct {
+		name   string
+		getter func(LogBaseTrialResult) float64
+	}
+	sigMetrics := []metric{
+		{"ValEff", func(r LogBaseTrialResult) float64 { return r.ValueEfficiency }},
+		{"Surplus", func(r LogBaseTrialResult) float64 { return r.AvgSurplus }},
+		{"SpecSurp", func(r LogBaseTrialResult) float64 { return r.SpecialistSurplus }},
+		{"GenSurp", func(r LogBaseTrialResult) float64 { return r.GeneralistSurplus }},
+		{"Revenue", func(r LogBaseTrialResult) float64 { return r.RevenuePerRound }},
+		{"WinCos", func(r LogBaseTrialResult) float64 { return r.MeanWinnerCos }},
+	}
+
+	for _, m := range sigMetrics {
+		vals := extractLB(baseCells, m.getter)
+		fmt.Printf("    %-10s", m.name)
+		for i := range baseCells {
+			if i == baselineIdx {
+				fmt.Printf("  %-13s", "(baseline)")
+				continue
+			}
+			_, p := welchT(vals[baselineIdx], vals[i])
+			fmt.Printf("  p=%.3f %-4s ", p, sigStars(p))
+		}
+		fmt.Println()
+	}
+
+	// Find best base by value efficiency
+	bestBase := math.E
+	bestLabel := "b=e"
+	bestVE := -1.0
+	for i, c := range baseCells {
+		vals := make([]float64, len(c.results))
+		for j, r := range c.results {
+			vals[j] = r.ValueEfficiency
+		}
+		m, _ := sampleMeanStd(vals)
+		if m > bestVE {
+			bestVE = m
+			bestBase = bases[i].base
+			bestLabel = bases[i].label
+		}
+	}
+	fmt.Printf("\n    Best log base by ValEff: %s (%.4f)\n", bestLabel, bestVE)
+
+	// --- Part B: Discovery Threshold Sweep ---
+	fmt.Printf("\n  Part B: Discovery Threshold Sweep (%s, λ=%.0f, %d trials)\n",
+		bestLabel, lambda, trials)
+
+	thresholds := []float64{0.0, 0.2, 0.3, 0.5, 0.7}
+	var threshCells []cellResults
+	for _, thresh := range thresholds {
+		label := fmt.Sprintf("τ=%.1f", thresh)
+		fmt.Printf("    Running %s...\n", label)
+		trialResults := make([]LogBaseTrialResult, trials)
+		for i := range trialResults {
+			trialResults[i] = runLogBaseTrial(bestBase, thresh, lambdas, valueDecay, int64(i*7919+42))
+		}
+		threshCells = append(threshCells, cellResults{label, trialResults})
+	}
+
+	fmt.Printf("\n    %-10s", "Metric")
+	for _, c := range threshCells {
+		fmt.Printf("  %-13s", c.label)
+	}
+	fmt.Println()
+	fmt.Printf("    %s\n", strings.Repeat("-", 10+15*len(threshCells)))
+
+	printRow("ValEff", threshCells, func(r LogBaseTrialResult) float64 { return r.ValueEfficiency })
+	printRow("Surplus", threshCells, func(r LogBaseTrialResult) float64 { return r.AvgSurplus })
+	printRow("SpecSurp", threshCells, func(r LogBaseTrialResult) float64 { return r.SpecialistSurplus })
+	printRow("GenSurp", threshCells, func(r LogBaseTrialResult) float64 { return r.GeneralistSurplus })
+	printRow("Revenue", threshCells, func(r LogBaseTrialResult) float64 { return r.RevenuePerRound })
+	printRow("WinCos", threshCells, func(r LogBaseTrialResult) float64 { return r.MeanWinnerCos })
+	printRow("NoShow%", threshCells, func(r LogBaseTrialResult) float64 { return r.NoShowRate * 100 })
+	printRow("WinDiv", threshCells, func(r LogBaseTrialResult) float64 { return r.WinDiversity })
+
+	// Significance tests vs τ=0.0
+	fmt.Printf("\n    Significance vs τ=0.0 (Welch's t):\n")
+	for _, m := range sigMetrics {
+		vals := extractLB(threshCells, m.getter)
+		fmt.Printf("    %-10s", m.name)
+		for i := range threshCells {
+			if i == 0 {
+				fmt.Printf("  %-13s", "(baseline)")
+				continue
+			}
+			_, p := welchT(vals[0], vals[i])
+			fmt.Printf("  p=%.3f %-4s ", p, sigStars(p))
+		}
+		fmt.Println()
+	}
+}
+
 // --- Main ---
 
 func main() {
@@ -1504,4 +1914,7 @@ func main() {
 
 	// Exp 2: Hotelling drift × cluster tightness analysis
 	runHotellingAnalysis(valueDecay)
+
+	// Exp 3: Log base & discovery threshold
+	runLogBaseExperiment(valueDecay)
 }
